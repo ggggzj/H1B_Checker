@@ -21,9 +21,12 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup():
-    """Initialize database on startup."""
-    init_db()
-    print("✅ FastAPI server started")
+    """
+    Application startup event.
+    Note: Database initialization is handled separately.
+    """
+    print("✅ Application started successfully")
+    pass
 
 # ============ Pydantic response models ============
 
