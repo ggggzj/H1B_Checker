@@ -1,181 +1,135 @@
 """
 H1B data processing script
-1. Read all .xlsx files under the /data folder
-2. Clean and filter data
-3. Batch import into PostgreSQL
+1. Read .xlsx files one at a time (memory efficient)
+2. Clean and filter each file in chunks
+3. Aggregate counts across all files
+4. Batch upsert into PostgreSQL in chunks of 1000
 """
 
 import pandas as pd
-import os
 from pathlib import Path
+from collections import defaultdict
 from sqlalchemy import text
-from database import engine, SessionLocal
-from models import Employer
-from datetime import datetime
+from database import engine
+from datetime import datetime, timezone
 
-# Columns to retain
-REQUIRED_COLUMNS = {
-    "EMPLOYER_NAME": "employer_name",
-    "CASE_STATUS": "case_status",
-    "VISA_CLASS": "visa_class",
-    "BEGIN_DATE": "begin_date",
-    "END_DATE": "end_date",
-    "EMPLOYER_STATE": "employer_state",
-    "EMPLOYER_CITY": "employer_city"
-}
+REQUIRED_COLUMNS = ["EMPLOYER_NAME", "CASE_STATUS"]
+BATCH_SIZE = 1000
 
-def load_xlsx_files(data_dir="data"):
-    """Load all xlsx files."""
-    data_path = Path(data_dir)
-    if not data_path.exists():
-        print(f"❌ Folder '{data_dir}' does not exist")
-        return None
-    
-    xlsx_files = list(data_path.glob("*.xlsx"))
-    if not xlsx_files:
-        print(f"⚠️  No .xlsx files found in '{data_dir}'")
-        return None
-    
-    print(f"📂 Found {len(xlsx_files)} xlsx file(s):")
-    for f in xlsx_files:
-        print(f"   - {f.name}")
-    
-    # Combine all sheets
-    dfs = []
-    for file in xlsx_files:
-        try:
-            df = pd.read_excel(file)
-            print(f"   ✅ Loaded: {file.name} ({len(df)} rows)")
-            dfs.append(df)
-        except Exception as e:
-            print(f"   ❌ Failed to load: {file.name} - {str(e)}")
-    
-    if dfs:
-        combined_df = pd.concat(dfs, ignore_index=True)
-        print(f"\n📊 Combined total: {len(combined_df)} rows")
-        return combined_df
-    return None
 
-def clean_and_filter(df):
-    """Clean and filter data."""
-    print("\n🔧 Cleaning data...")
-    
-    # 1. Check required columns exist
-    available_cols = set(df.columns)
-    missing_cols = set(REQUIRED_COLUMNS.keys()) - available_cols
-    
-    if missing_cols:
-        print(f"⚠️  Missing columns: {missing_cols}")
-        print(f"   Available columns: {sorted(available_cols)}")
-        # Use intersection: only columns that exist
-        cols_to_use = [col for col in REQUIRED_COLUMNS.keys() if col in available_cols]
-    else:
-        cols_to_use = list(REQUIRED_COLUMNS.keys())
-    
-    # 2. Keep only required columns
-    df = df[cols_to_use].copy()
-    
-    # 3. Filter: keep rows where CASE_STATUS == "Certified"
-    if "CASE_STATUS" in cols_to_use:
-        initial_count = len(df)
-        df = df[df["CASE_STATUS"] == "Certified"]
-        filtered_count = initial_count - len(df)
-        print(f"   Filtered out non-certified: {filtered_count} rows (remaining: {len(df)} rows)")
-    
-    # 4. Normalize employer name: strip whitespace, uppercase
-    if "EMPLOYER_NAME" in cols_to_use:
-        df["EMPLOYER_NAME"] = df["EMPLOYER_NAME"].str.strip().str.upper()
-    
-    # 5. Drop null employer names
-    initial_count = len(df)
-    df = df.dropna(subset=["EMPLOYER_NAME"])
-    print(f"   Dropped nulls: {initial_count - len(df)} rows")
-    
-    print(f"✅ Cleaning done: {len(df)} rows available")
-    return df
+def process_file(file: Path) -> dict:
+    """
+    Read one Excel file, filter certified H1B rows,
+    and return a dict of {employer_name: count}.
+    Processes in chunks of 10000 rows to limit memory usage.
+    """
+    counts = defaultdict(int)
+    chunk_size = 10_000
+    total_rows = 0
+    certified_rows = 0
 
-def aggregate_data(df):
-    """Group by employer name and count H1B filings."""
-    print("\n📈 Aggregating...")
-    
-    if "EMPLOYER_NAME" not in df.columns:
-        print("❌ EMPLOYER_NAME column not found")
-        return None
-    
-    aggregated = df.groupby("EMPLOYER_NAME").size().reset_index(name="h1b_count")
-    aggregated = aggregated.sort_values("h1b_count", ascending=False)
-    
-    print(f"✅ Aggregation done: {len(aggregated)} employers")
-    print(f"\n📊 Top 10 employers:")
-    print(aggregated.head(10).to_string(index=False))
-    
-    return aggregated
+    xl = pd.ExcelFile(file)
+    sheet = xl.sheet_names[0]
+    df_full = xl.parse(sheet)
+    total_in_file = len(df_full)
 
-def upsert_to_db(aggregated_df):
-    """Batch insert/update rows in the database (UPSERT)."""
-    print("\n💾 Importing to database...")
-    
-    db = SessionLocal()
-    try:
-        now = datetime.utcnow()
-        
-        for idx, row in aggregated_df.iterrows():
-            employer_name = row["EMPLOYER_NAME"]
-            h1b_count = row["h1b_count"]
-            
-            existing = db.query(Employer).filter(
-                Employer.employer_name == employer_name
-            ).first()
-            
-            if existing:
-                existing.h1b_count = h1b_count
-                existing.last_updated = now
-            else:
-                new_employer = Employer(
-                    employer_name=employer_name,
-                    h1b_count=h1b_count,
-                    last_updated=now
-                )
-                db.add(new_employer)
-            
-            if (idx + 1) % 100 == 0:
-                print(f"   Processed {idx + 1} record(s)...")
-        
-        db.commit()
-        print(f"✅ Successfully imported {len(aggregated_df)} employer record(s)")
-        
-    except Exception as e:
-        db.rollback()
-        print(f"❌ Import failed: {str(e)}")
-    finally:
-        db.close()
+    for start in range(0, total_in_file, chunk_size):
+        chunk = df_full.iloc[start : start + chunk_size].copy()
+        total_rows += len(chunk)
+
+        missing = [c for c in REQUIRED_COLUMNS if c not in chunk.columns]
+        if missing:
+            print(f"   ⚠️  Missing columns {missing} — skipping chunk")
+            continue
+
+        chunk = chunk[chunk["CASE_STATUS"] == "Certified"]
+        chunk = chunk.dropna(subset=["EMPLOYER_NAME"])
+        chunk["EMPLOYER_NAME"] = chunk["EMPLOYER_NAME"].str.strip().str.upper()
+
+        certified_rows += len(chunk)
+        for name, grp in chunk.groupby("EMPLOYER_NAME"):
+            counts[name] += len(grp)
+
+    print(f"   ✅ {file.name}: {total_rows} rows → {certified_rows} certified → {len(counts)} employers")
+    return dict(counts)
+
+
+def merge_counts(all_counts: list[dict]) -> list[dict]:
+    """Merge per-file counts into a single sorted list."""
+    merged = defaultdict(int)
+    for c in all_counts:
+        for name, count in c.items():
+            merged[name] += count
+    result = sorted(
+        [{"employer_name": k, "h1b_count": v} for k, v in merged.items()],
+        key=lambda x: x["h1b_count"],
+        reverse=True,
+    )
+    return result
+
+
+def batch_upsert(records: list[dict], batch_size: int = BATCH_SIZE):
+    """
+    Upsert records into the employers table in batches.
+    Uses ON CONFLICT to update existing rows.
+    """
+    now = datetime.now(timezone.utc)
+    total = len(records)
+    inserted = 0
+
+    upsert_sql = text("""
+        INSERT INTO employers (employer_name, h1b_count, last_updated)
+        VALUES (:employer_name, :h1b_count, :last_updated)
+        ON CONFLICT (employer_name)
+        DO UPDATE SET
+            h1b_count    = EXCLUDED.h1b_count,
+            last_updated = EXCLUDED.last_updated
+    """)
+
+    with engine.begin() as conn:
+        for i in range(0, total, batch_size):
+            batch = records[i : i + batch_size]
+            for r in batch:
+                r["last_updated"] = now
+            conn.execute(upsert_sql, batch)
+            inserted += len(batch)
+            print(f"   Upserted {inserted}/{total} records...")
+
+    print(f"✅ Successfully upserted {total} employer records")
+
 
 def main():
-    """Main pipeline."""
     print("=" * 60)
     print("🚀 H1B data processing script")
     print("=" * 60)
-    
-    df = load_xlsx_files("data")
-    if df is None:
-        print("❌ Could not read data files; exiting")
+
+    data_path = Path("data")
+    xlsx_files = sorted(data_path.glob("*.xlsx"))
+    if not xlsx_files:
+        print("❌ No .xlsx files found in data/")
         return
-    
-    df = clean_and_filter(df)
-    if df is None or len(df) == 0:
-        print("❌ No valid data; exiting")
-        return
-    
-    aggregated = aggregate_data(df)
-    if aggregated is None or len(aggregated) == 0:
-        print("❌ Aggregation failed; exiting")
-        return
-    
-    upsert_to_db(aggregated)
-    
+
+    print(f"📂 Found {len(xlsx_files)} file(s):\n")
+
+    all_counts = []
+    for file in xlsx_files:
+        counts = process_file(file)
+        all_counts.append(counts)
+
+    print(f"\n📈 Merging counts across all files...")
+    records = merge_counts(all_counts)
+    print(f"✅ {len(records)} unique employers")
+    print(f"\n📊 Top 10:")
+    for r in records[:10]:
+        print(f"   {r['employer_name']:<50} {r['h1b_count']}")
+
+    print(f"\n💾 Upserting to database in batches of {BATCH_SIZE}...")
+    batch_upsert(records)
+
     print("\n" + "=" * 60)
     print("✅ All steps completed.")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     main()

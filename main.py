@@ -5,6 +5,7 @@ FastAPI H1B Checker API
 """
 
 from fastapi import FastAPI, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from fuzzywuzzy import fuzz
@@ -17,6 +18,17 @@ app = FastAPI(
     title="H1B Checker API",
     description="Look up employers with certified H1B LCA data",
     version="1.0.0"
+)
+
+# Allow Chrome extensions and browser clients to call the API.
+# Chrome extensions send Origin: chrome-extension://<id>
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"chrome-extension://.*",
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 
 @app.on_event("startup")
