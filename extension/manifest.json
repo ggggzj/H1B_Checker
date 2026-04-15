@@ -1,0 +1,20 @@
+{
+    "manifest_version": 3,
+    "name": "H1B Checker",
+    "version": "1.0.0",
+    "description": "Show H1B sponsorship on LinkedIn jobs",
+    "permissions": ["scripting", "activeTab"],
+    "host_permissions": ["https://www.linkedin.com/*", "https://h1bchecker-production.up.railway.app/*"],
+    "content_scripts": [
+    {
+    "matches": ["https://www.linkedin.com/*"],
+    "js": ["content.js"],
+    "css": ["style.css"]
+    }
+    ],
+    "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "128": "icons/icon128.png"
+    }
+    }
