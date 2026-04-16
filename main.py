@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from fuzzywuzzy import fuzz
 from database import init_db, get_db
-from models import Employer
+from models import Employer, EmployerAlias
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -43,17 +43,23 @@ async def startup():
 # ============ Pydantic response models ============
 
 class CheckResponse(BaseModel):
-    """Response for a single-company check."""
+    """Response for a single-company /check lookup."""
     found: bool
     employer_name: Optional[str] = None
+    # Total unique certified H-1B LCA filings for this employer
     h1b_count: Optional[int] = None
     sponsors_h1b: bool
+    # Extra fields from the enriched employers table
+    earliest_decision_date: Optional[str] = None
+    latest_decision_date: Optional[str] = None
+    last_active_year: Optional[int] = None
+    h1b_dependent: Optional[bool] = None
 
     class Config:
         from_attributes = True
 
 class SearchResult(BaseModel):
-    """One search result row."""
+    """One result row returned by /search."""
     employer_name: str
     h1b_count: int
 
@@ -64,49 +70,74 @@ class SearchResponse(BaseModel):
 
 # ============ API routes ============
 
+def _employer_to_check_response(employer: Employer) -> CheckResponse:
+    """Convert an Employer ORM row into a CheckResponse dict."""
+    return CheckResponse(
+        found=True,
+        employer_name=employer.employer_name,
+        # Expose total_h1b_certified as h1b_count so the Chrome extension
+        # doesn't need to change its field name
+        h1b_count=employer.total_h1b_certified,
+        sponsors_h1b=True,
+        earliest_decision_date=(
+            str(employer.earliest_decision_date)
+            if employer.earliest_decision_date else None
+        ),
+        latest_decision_date=(
+            str(employer.latest_decision_date)
+            if employer.latest_decision_date else None
+        ),
+        last_active_year=employer.last_active_year,
+        h1b_dependent=employer.h1b_dependent,
+    )
+
+
 @app.get("/check", response_model=CheckResponse)
 async def check_employer(
     company: str = Query(..., min_length=1, description="Company name"),
     db: Session = Depends(get_db)
 ):
     """
-    Check whether a company sponsors H1B (certified LCA data).
+    Check whether a company sponsors H1B.
+
+    Lookup order:
+      1. Exact match on employer_name
+      2. Alias lookup (TRADE_NAME_DBA) → resolve to primary employer
+      3. ILIKE substring match on employer_name
 
     Example: /check?company=Google
     """
     company_upper = company.strip().upper()
-    
-    # 1) Exact match
+
+    # 1) Exact match on the canonical employer name
     employer = db.query(Employer).filter(
         Employer.employer_name == company_upper
     ).first()
-    
     if employer:
-        return CheckResponse(
-            found=True,
-            employer_name=employer.employer_name,
-            h1b_count=employer.h1b_count,
-            sponsors_h1b=True
-        )
-    
-    # 2) Fuzzy match (ILIKE)
+        return _employer_to_check_response(employer)
+
+    # 2) Alias lookup — check if the name is a known DBA / trade name
+    alias = db.query(EmployerAlias).filter(
+        EmployerAlias.alias_name == company_upper
+    ).first()
+    if alias:
+        # Resolve alias → primary employer
+        primary = db.query(Employer).filter(
+            Employer.employer_name == alias.primary_employer_name
+        ).first()
+        if primary:
+            return _employer_to_check_response(primary)
+
+    # 3) Substring (ILIKE) match — handles partial names like "Google" → "GOOGLE LLC"
     fuzzy_match = db.query(Employer).filter(
         Employer.employer_name.ilike(f"%{company_upper}%")
-    ).first()
-    
+    ).order_by(Employer.total_h1b_certified.desc()).first()
     if fuzzy_match:
-        return CheckResponse(
-            found=True,
-            employer_name=fuzzy_match.employer_name,
-            h1b_count=fuzzy_match.h1b_count,
-            sponsors_h1b=True
-        )
-    
-    # Not found
-    return CheckResponse(
-        found=False,
-        sponsors_h1b=False
-    )
+        return _employer_to_check_response(fuzzy_match)
+
+    # Not found in any lookup
+    return CheckResponse(found=False, sponsors_h1b=False)
+
 
 @app.get("/search", response_model=SearchResponse)
 async def search_employers(
@@ -120,39 +151,31 @@ async def search_employers(
     Example: /search?q=amazon&limit=5
     """
     q_upper = q.strip().upper()
-    
-    # Employers whose name contains the keyword
+
+    # Fetch all employers whose name contains the keyword
     all_employers = db.query(Employer).filter(
         Employer.employer_name.ilike(f"%{q_upper}%")
     ).all()
-    
+
     if not all_employers:
         return SearchResponse(results=[], total=0)
-    
-    # Score with fuzzywuzzy and sort
-    scored_employers = [
-        (employer, fuzz.partial_ratio(q_upper, employer.employer_name))
-        for employer in all_employers
-    ]
-    
-    # Sort by score descending
-    scored_employers.sort(key=lambda x: x[1], reverse=True)
-    
-    # Top `limit` results
-    top_results = scored_employers[:limit]
-    
+
+    # Score each result with fuzzywuzzy and sort by score descending
+    scored = sorted(
+        all_employers,
+        key=lambda emp: fuzz.partial_ratio(q_upper, emp.employer_name),
+        reverse=True,
+    )
+
     results = [
         SearchResult(
             employer_name=emp.employer_name,
-            h1b_count=emp.h1b_count
+            h1b_count=emp.total_h1b_certified,
         )
-        for emp, score in top_results
+        for emp in scored[:limit]
     ]
-    
-    return SearchResponse(
-        results=results,
-        total=len(results)
-    )
+
+    return SearchResponse(results=results, total=len(results))
 
 # ============ Health ============
 
