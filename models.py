@@ -16,6 +16,7 @@ produced by clean_data.py. main.py queries them to answer API requests.
 
 from sqlalchemy import Column, Integer, String, Date, Boolean, Numeric, DateTime
 from sqlalchemy.ext.declarative import declarative_base
+from pgvector.sqlalchemy import Vector
 from datetime import datetime
 
 # Base class that all ORM models inherit from.
@@ -54,6 +55,9 @@ class Employer(Base):
 
     # Timestamp of the last upload_to_railway.py run
     last_updated = Column(DateTime, default=datetime.utcnow)
+
+    # text-embedding-3-small (1536 dims) — populated offline for semantic /check fallback
+    embedding = Column(Vector(1536), nullable=True)
 
     def __repr__(self):
         return (

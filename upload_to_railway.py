@@ -5,9 +5,9 @@ Reads the three CSV files produced by clean_data.py and upserts them
 into Railway PostgreSQL. Handles table creation automatically.
 
 Tables created / updated:
-  employers            — one row per unique employer (replaces old h1b_count data)
-  employer_job_levels  — wage level breakdown per employer + job title
-  employer_aliases     — trade name / DBA aliases
+  employers            — CREATE IF NOT EXISTS + upsert (preserves embedding column)
+  employer_job_levels  — dropped and recreated each run (no embeddings)
+  employer_aliases     — dropped and recreated each run (no embeddings)
 
 Usage:
   python upload_to_railway.py
@@ -50,25 +50,13 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False, poolclass=N
 
 # ─── Table creation ───────────────────────────────────────────────────────────
 
-CREATE_TABLES_SQL = """
--- Drop and recreate the three tables so old data is fully replaced.
--- CASCADE drops any foreign key references automatically.
+# employers: never dropped here — keeps precomputed pgvector embeddings.
+# If the DB predates the embedding column, ALTER ADD COLUMN IF NOT EXISTS fixes it.
 
+# job_levels + aliases: cheap to rebuild; drop each run for a clean replace.
+DROP_AND_RECREATE_JOB_LEVELS_ALIASES_SQL = """
 DROP TABLE IF EXISTS employer_job_levels CASCADE;
 DROP TABLE IF EXISTS employer_aliases     CASCADE;
-DROP TABLE IF EXISTS employers            CASCADE;
-
-CREATE TABLE employers (
-    id                      SERIAL PRIMARY KEY,
-    employer_name           TEXT   NOT NULL UNIQUE,
-    total_h1b_certified     INT    NOT NULL DEFAULT 0,
-    earliest_decision_date  DATE,
-    latest_decision_date    DATE,
-    last_active_year        INT,
-    h1b_dependent           BOOLEAN,
-    last_updated            TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_employers_name ON employers (employer_name);
 
 CREATE TABLE employer_job_levels (
     id                   SERIAL PRIMARY KEY,
@@ -100,11 +88,33 @@ CREATE INDEX idx_aliases_name    ON employer_aliases (alias_name);
 
 
 def create_tables():
-    """Drop old tables and create fresh ones with the new schema."""
-    print("🔧 Creating tables...")
+    """
+    Ensure employers exists (with embedding column) without dropping it.
+    Drop and recreate employer_job_levels and employer_aliases only.
+    """
+    print("🔧 Creating / migrating tables...")
     with engine.begin() as conn:
-        conn.execute(text(CREATE_TABLES_SQL))
-    print("   ✅ Tables created successfully\n")
+        for stmt in (
+            "CREATE EXTENSION IF NOT EXISTS vector",
+            """
+            CREATE TABLE IF NOT EXISTS employers (
+                id                      SERIAL PRIMARY KEY,
+                employer_name           TEXT   NOT NULL UNIQUE,
+                total_h1b_certified     INT    NOT NULL DEFAULT 0,
+                earliest_decision_date  DATE,
+                latest_decision_date    DATE,
+                last_active_year        INT,
+                h1b_dependent           BOOLEAN,
+                last_updated            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                embedding               vector(1536)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_employers_name ON employers (employer_name)",
+            "ALTER TABLE employers ADD COLUMN IF NOT EXISTS embedding vector(1536)",
+        ):
+            conn.execute(text(stmt.strip()))
+        conn.execute(text(DROP_AND_RECREATE_JOB_LEVELS_ALIASES_SQL))
+    print("   ✅ employers preserved / migrated; job_levels & aliases recreated\n")
 
 
 # ─── CSV reader ───────────────────────────────────────────────────────────────
@@ -174,6 +184,7 @@ def upload_employers(rows: list[dict]) -> None:
     """
     Upsert employers.csv data into the employers table.
     Uses INSERT ... ON CONFLICT DO UPDATE so re-running is safe.
+    The UPDATE clause does not touch embedding — existing vectors are kept.
     """
     print(f"📤 Uploading employers ({len(rows):,} rows)...")
 
@@ -336,7 +347,7 @@ def main():
     print(f"   employer_job_levels:  {len(job_level_rows):,} rows")
     print(f"   employer_aliases:     {len(alias_rows):,} rows\n")
 
-    # Step 1: Recreate tables (drops old data)
+    # Step 1: Migrate employers in place; drop/recreate job_levels & aliases only
     create_tables()
 
     # Step 2: Upload each table

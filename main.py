@@ -4,15 +4,25 @@ FastAPI H1B Checker API
 - GET /search?q=amazon&limit=5    → fuzzy search (autocomplete)
 """
 
+import json
+import logging
+import os
+from functools import lru_cache
+from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
 from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
 from fuzzywuzzy import fuzz
-from database import init_db, get_db
-from models import Employer, EmployerAlias
+from openai import OpenAI
 from pydantic import BaseModel
-from typing import Optional, List
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from clean_data import normalize_employer
+from database import get_db
+from models import Employer, EmployerAlias
 
 app = FastAPI(
     title="H1B Checker API",
@@ -30,6 +40,16 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+_openai_client: Optional[OpenAI] = None
+
+
+def _get_openai_client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _openai_client
+
 
 @app.on_event("startup")
 async def startup():
@@ -49,6 +69,10 @@ class CheckResponse(BaseModel):
     # Total unique certified H-1B LCA filings for this employer
     h1b_count: Optional[int] = None
     sponsors_h1b: bool
+    # How the employer was resolved: exact | alias | fuzzy | semantic | invalid_input
+    match_type: Optional[str] = None
+    # 0.0–1.0; semantic (and damped ambiguous) may be < 1.0
+    match_confidence: Optional[float] = None
     # Extra fields from the enriched employers table
     earliest_decision_date: Optional[str] = None
     latest_decision_date: Optional[str] = None
@@ -68,9 +92,154 @@ class SearchResponse(BaseModel):
     results: List[SearchResult]
     total: int
 
+# ============ Semantic search (Layer 4 fallback) ====================
+
+
+def _embedding_to_pg_vector_literal(values: list[float]) -> str:
+    """Serialize embedding for PostgreSQL vector cast (JSON array syntax)."""
+    return json.dumps([float(x) for x in values])
+
+
+@lru_cache(maxsize=1000)
+def _embedding_lru_cached(text_key: str) -> tuple[float, ...]:
+    """
+    OpenAI embedding for text_key, cached by exact string.
+    Returns an immutable tuple so lru_cache can store it safely.
+    Raises on API/network errors (not cached).
+    """
+    client = _get_openai_client()
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text_key,
+    )
+    emb = response.data[0].embedding
+    return tuple(float(x) for x in emb)
+
+
+def get_embedding_cached(text_key: str) -> Optional[list[float]]:
+    """
+    Embedding for normalized company name with LRU cache on success.
+    Failures are not cached.
+    """
+    try:
+        return list(_embedding_lru_cached(text_key))
+    except Exception as e:
+        print(f"⚠️  OpenAI API error (get_embedding_cached): {e}")
+        return None
+
+
+def semantic_search(
+    query: str,
+    db: Session,
+    similarity_threshold: float = 0.75,
+    top_k: int = 3,
+) -> Tuple[Optional[Employer], float, bool]:
+    """
+    pgvector cosine distance (<=>); similarity score = 1 - distance.
+
+    Returns (best_employer | None, top1_similarity, is_ambiguous).
+
+    Logs Layer 4 activity at INFO (flow / outcomes) and WARNING (failures)
+    for monitoring and debugging. Enable with e.g. LOG_LEVEL=INFO on Railway.
+    """
+    logger.info(
+        "semantic_search start query=%r top_k=%s similarity_threshold=%s",
+        query,
+        top_k,
+        similarity_threshold,
+    )
+    try:
+        query_emb = get_embedding_cached(query)
+        if not query_emb:
+            logger.warning(
+                "semantic_search skip query=%r reason=no_query_embedding",
+                query,
+            )
+            return None, 0.0, False
+
+        vec_lit = _embedding_to_pg_vector_literal(query_emb)
+        sql = text(
+            """
+            SELECT
+                id,
+                employer_name,
+                total_h1b_certified,
+                1 - (embedding <=> CAST(:emb AS vector)) AS similarity
+            FROM employers
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> CAST(:emb AS vector)
+            LIMIT :k
+            """
+        )
+        results = db.execute(sql, {"emb": vec_lit, "k": top_k}).mappings().all()
+
+        if not results:
+            logger.info(
+                "semantic_search miss query=%r reason=no_rows_with_embedding",
+                query,
+            )
+            return None, 0.0, False
+
+        top1_score = float(results[0]["similarity"])
+        is_ambiguous = False
+        margin: Optional[float] = None
+        if len(results) > 1:
+            top2_score = float(results[1]["similarity"])
+            margin = top1_score - top2_score
+            if margin < 0.1:
+                is_ambiguous = True
+
+        preview = [
+            {
+                "id": int(r["id"]),
+                "employer_name": r["employer_name"],
+                "similarity": round(float(r["similarity"]), 4),
+            }
+            for r in results
+        ]
+        logger.info(
+            "semantic_search candidates query=%r top=%s ambiguous=%s margin=%s",
+            query,
+            preview,
+            is_ambiguous,
+            round(margin, 4) if margin is not None else None,
+        )
+
+        if top1_score < similarity_threshold:
+            logger.info(
+                "semantic_search miss query=%r reason=below_threshold "
+                "top1_similarity=%.4f threshold=%.2f ambiguous=%s",
+                query,
+                top1_score,
+                similarity_threshold,
+                is_ambiguous,
+            )
+            return None, top1_score, is_ambiguous
+
+        best_match = db.query(Employer).filter(Employer.id == results[0]["id"]).first()
+        logger.info(
+            "semantic_search hit query=%r employer_id=%s employer_name=%r "
+            "similarity=%.4f ambiguous=%s",
+            query,
+            results[0]["id"],
+            results[0]["employer_name"],
+            top1_score,
+            is_ambiguous,
+        )
+        return best_match, top1_score, is_ambiguous
+
+    except Exception as e:
+        logger.warning("semantic_search error query=%r err=%s", query, e, exc_info=True)
+        return None, 0.0, False
+
+
 # ============ API routes ============
 
-def _employer_to_check_response(employer: Employer) -> CheckResponse:
+def _employer_to_check_response(
+    employer: Employer,
+    match_type: str = "exact",
+    match_confidence: float = 1.0,
+) -> CheckResponse:
     """Convert an Employer ORM row into a CheckResponse dict."""
     return CheckResponse(
         found=True,
@@ -79,6 +248,8 @@ def _employer_to_check_response(employer: Employer) -> CheckResponse:
         # doesn't need to change its field name
         h1b_count=employer.total_h1b_certified,
         sponsors_h1b=True,
+        match_type=match_type,
+        match_confidence=match_confidence,
         earliest_decision_date=(
             str(employer.earliest_decision_date)
             if employer.earliest_decision_date else None
@@ -95,47 +266,65 @@ def _employer_to_check_response(employer: Employer) -> CheckResponse:
 @app.get("/check", response_model=CheckResponse)
 async def check_employer(
     company: str = Query(..., min_length=1, description="Company name"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
-    Check whether a company sponsors H1B.
+    Check whether a company sponsors H1B (four-layer resolution).
 
     Lookup order:
-      1. Exact match on employer_name
-      2. Alias lookup (TRADE_NAME_DBA) → resolve to primary employer
+      1. Exact match on employer_name (normalized)
+      2. Alias lookup (TRADE_NAME_DBA) → primary employer
       3. ILIKE substring match on employer_name
+      4. Semantic search (pgvector) when 1–3 miss
 
     Example: /check?company=Google
     """
-    company_upper = company.strip().upper()
+    company_normalized = normalize_employer(company)
+    if not company_normalized:
+        return CheckResponse(
+            found=False,
+            sponsors_h1b=False,
+            match_type="invalid_input",
+            match_confidence=None,
+        )
 
     # 1) Exact match on the canonical employer name
     employer = db.query(Employer).filter(
-        Employer.employer_name == company_upper
+        Employer.employer_name == company_normalized
     ).first()
     if employer:
-        return _employer_to_check_response(employer)
+        return _employer_to_check_response(employer, match_type="exact")
 
     # 2) Alias lookup — check if the name is a known DBA / trade name
     alias = db.query(EmployerAlias).filter(
-        EmployerAlias.alias_name == company_upper
+        EmployerAlias.alias_name == company_normalized
     ).first()
     if alias:
-        # Resolve alias → primary employer
         primary = db.query(Employer).filter(
             Employer.employer_name == alias.primary_employer_name
         ).first()
         if primary:
-            return _employer_to_check_response(primary)
+            return _employer_to_check_response(primary, match_type="alias")
 
     # 3) Substring (ILIKE) match — handles partial names like "Google" → "GOOGLE LLC"
     fuzzy_match = db.query(Employer).filter(
-        Employer.employer_name.ilike(f"%{company_upper}%")
+        Employer.employer_name.ilike(f"%{company_normalized}%")
     ).order_by(Employer.total_h1b_certified.desc()).first()
     if fuzzy_match:
-        return _employer_to_check_response(fuzzy_match)
+        return _employer_to_check_response(fuzzy_match, match_type="fuzzy")
 
-    # Not found in any lookup
+    # 4) Semantic fallback (requires OPENAI_API_KEY + pgvector embeddings on rows)
+    semantic_match, confidence, is_ambiguous = semantic_search(
+        company_normalized, db
+    )
+    if semantic_match:
+        match_confidence = confidence * 0.9 if is_ambiguous else confidence
+        return _employer_to_check_response(
+            semantic_match,
+            match_type="semantic",
+            match_confidence=match_confidence,
+        )
+
     return CheckResponse(found=False, sponsors_h1b=False)
 
 
@@ -150,11 +339,13 @@ async def search_employers(
 
     Example: /search?q=amazon&limit=5
     """
-    q_upper = q.strip().upper()
+    q_norm = normalize_employer(q)
+    if not q_norm:
+        return SearchResponse(results=[], total=0)
 
     # Fetch all employers whose name contains the keyword
     all_employers = db.query(Employer).filter(
-        Employer.employer_name.ilike(f"%{q_upper}%")
+        Employer.employer_name.ilike(f"%{q_norm}%")
     ).all()
 
     if not all_employers:
@@ -163,7 +354,7 @@ async def search_employers(
     # Score each result with fuzzywuzzy and sort by score descending
     scored = sorted(
         all_employers,
-        key=lambda emp: fuzz.partial_ratio(q_upper, emp.employer_name),
+        key=lambda emp: fuzz.partial_ratio(q_norm, emp.employer_name),
         reverse=True,
     )
 
@@ -199,15 +390,45 @@ async def root():
     }
 
 if __name__ == "__main__":
-    import os
     import uvicorn
-    
+
     # Read port from environment variable (Railway will set this)
     port = int(os.getenv("PORT", 8000))
-    
+
     # Run the server
     uvicorn.run(
-        app, 
+        app,
         host="0.0.0.0",  # Important! Must be 0.0.0.0 to receive external requests
         port=port
     )
+
+# ==================== Testing Checklist ====================
+# Layer 1 - Exact:
+#   curl "localhost:8000/check?company=GOOGLE LLC"
+#   Expected: {"found": true, "match_type": "exact", "match_confidence": 1.0}
+#
+# Layer 2 - Alias:
+#   curl "localhost:8000/check?company=GOOGLE"  # if DBA table has this alias
+#   Expected: {"found": true, "match_type": "alias"}
+#
+# Layer 3 - Fuzzy:
+#   curl "localhost:8000/check?company=Google"
+#   Expected: {"found": true, "match_type": "fuzzy"}
+#
+# Layer 4 - Semantic:
+#   curl "localhost:8000/check?company=Facebook"
+#   Expected: {"found": true, "employer_name": "META PLATFORMS INC",
+#             "match_type": "semantic", "match_confidence": ~0.8+}
+#
+#   curl "localhost:8000/check?company=Alphabet"
+#   Expected: {"employer_name": "GOOGLE LLC", "match_type": "semantic"}
+#
+#   curl "localhost:8000/check?company=PWC"
+#   Expected: {"employer_name": "PRICEWATERHOUSECOOPERS LLP"}
+#
+# Edge Cases:
+#   curl "localhost:8000/check?company="  # rejected by FastAPI (min_length)
+#   curl "gibberish" normalized empty → invalid_input if applicable
+#
+#   curl "localhost:8000/check?company=NonExistentCompany12345"
+#   Expected: {"found": false}
