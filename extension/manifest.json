@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "H1B Checker for LinkedIn Jobs",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Show H1B visa sponsorship status on LinkedIn job listings based on official DOL LCA data.",
   "permissions": [],
   "host_permissions": [

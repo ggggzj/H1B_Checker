@@ -23,6 +23,8 @@ const API_URL = 'https://h1bchecker-production.up.railway.app';
 // Prevents making duplicate API calls for the same company on one page load
 const cache = new Map();
 
+const MAX_NAME_ATTEMPTS = 8;
+
 
 // ─────────────────────────────────────────────
 // FUNCTION 1: processJobs
@@ -41,28 +43,27 @@ async function processJobs() {
 
   // Loop over every job card found on the page
   for (const card of jobCards) {
-    // Skip this card if we have already processed it in a previous run
-    // data-h1b-processed is a custom attribute we set ourselves as a marker
-    if (card.dataset.h1bProcessed) continue;
+    if (card.dataset.h1bDone === '1' || card.dataset.h1bDone === 'abandon') continue;
 
-    // Mark this card as processed so we don't process it again when
-    // the MutationObserver fires after a DOM change
-    card.dataset.h1bProcessed = 'true';
-
-    // Try to read the company name text from this card's HTML
     const companyName = getCompanyName(card);
 
-    // If we couldn't find a company name, skip this card entirely
-    if (!companyName) continue;
+    if (!companyName) {
+      const n = parseInt(card.dataset.h1bNameAttempts || '0', 10) + 1;
+      card.dataset.h1bNameAttempts = String(n);
+      if (n >= MAX_NAME_ATTEMPTS) {
+        card.dataset.h1bDone = 'abandon';
+      }
+      continue;
+    }
 
-    // Call the Railway API with the company name and wait for the result
+    card.dataset.h1bNameAttempts = '0';
+
     const sponsorInfo = await getH1BInfo(companyName);
 
-    // If the API call failed or returned nothing, skip this card
     if (!sponsorInfo) continue;
 
-    // All good — inject the H1B badge onto this card
     addBadge(card, sponsorInfo);
+    card.dataset.h1bDone = '1';
   }
 }
 
@@ -71,23 +72,44 @@ async function processJobs() {
 // FUNCTION 2: getCompanyName
 // Reads the company name text from a single job card element
 // ─────────────────────────────────────────────
+function _trimCompanyText(s) {
+  if (!s) return null;
+  const t = String(s).replace(/\s+/g, ' ').trim();
+  if (!t || t.length > 200) return null;
+  return t;
+}
+
 function getCompanyName(card) {
-  // LinkedIn (as of 2025) places the company name inside:
-  // <div class="artdeco-entity-lockup__subtitle">
-  //   <div dir="ltr">Company Name Here</div>
-  // </div>
-  // We target the inner div[dir="ltr"] for a precise match
-  const subtitle = card.querySelector('.artdeco-entity-lockup__subtitle div[dir="ltr"]');
+  const pick = (el) => _trimCompanyText(el?.textContent);
 
-  // If found, return the text content with leading/trailing spaces removed
-  if (subtitle) return subtitle.textContent.trim();
+  // Job detail / some list layouts — entity lockup subtitle
+  let el = card.querySelector('.artdeco-entity-lockup__subtitle div[dir="ltr"]');
+  if (el) return pick(el);
 
-  // Fallback: if LinkedIn changes the inner structure, try the parent element
-  // This is less precise but more resilient to minor HTML changes
-  const subtitleAlt = card.querySelector('.artdeco-entity-lockup__subtitle');
-  if (subtitleAlt) return subtitleAlt.textContent.trim();
+  el = card.querySelector('.artdeco-entity-lockup__subtitle');
+  if (el) return pick(el);
 
-  // If neither selector matched, return null — caller will skip this card
+  // Jobs search-results list (common 2025–2026)
+  el = card.querySelector('.job-card-container__company-name');
+  if (el) {
+    const name = pick(el);
+    if (name) return name;
+  }
+
+  el = card.querySelector('.base-search-card__subtitle');
+  if (el) return pick(el);
+
+  // Secondary line under job title in compact cards
+  el = card.querySelector('.base-card__subtitle, .base-main-card__subtitle');
+  if (el) return pick(el);
+
+  // Company profile link text inside the card
+  const link = card.querySelector('a[href*="/company/"]');
+  if (link) {
+    const name = pick(link);
+    if (name) return name;
+  }
+
   return null;
 }
 
@@ -110,6 +132,11 @@ async function getH1BInfo(companyName) {
     // encodeURIComponent handles special characters like "&" or "+" in company names
     // e.g. "Ernst & Young" → "Ernst%20%26%20Young"
     const response = await fetch(`${API_URL}/check?company=${encodeURIComponent(companyName)}`);
+
+    if (!response.ok) {
+      console.error('H1B API HTTP error:', response.status, await response.text());
+      return null;
+    }
 
     // Parse the JSON response body
     // Expected shape: { sponsors_h1b: true/false, h1b_count: 8810, ... }
