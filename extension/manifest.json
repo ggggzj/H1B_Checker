@@ -1,20 +1,27 @@
 {
-    "manifest_version": 3,
-    "name": "H1B Checker",
-    "version": "1.0.0",
-    "description": "Show H1B sponsorship on LinkedIn jobs",
-    "permissions": ["scripting", "activeTab"],
-    "host_permissions": ["https://www.linkedin.com/*", "https://h1bchecker-production.up.railway.app/*"],
-    "content_scripts": [
+  "manifest_version": 3,
+  "name": "H1B Checker for LinkedIn Jobs",
+  "version": "1.0.0",
+  "description": "Show H1B visa sponsorship status on LinkedIn job listings based on official DOL LCA data.",
+  "permissions": [],
+  "host_permissions": [
+    "https://www.linkedin.com/jobs/*",
+    "https://h1bchecker-production.up.railway.app/*"
+  ],
+  "content_scripts": [
     {
-    "matches": ["https://www.linkedin.com/*"],
-    "js": ["content.js"],
-    "css": ["style.css"]
+      "matches": ["https://www.linkedin.com/jobs/*"],
+      "js": ["content.js"],
+      "css": ["style.css"],
+      "run_at": "document_idle"
     }
-    ],
-    "icons": {
+  ],
+  "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-    }
-    }
+  },
+  "author": "ggggzj",
+  "homepage_url": "https://github.com/ggggzj/H1B_Checker"
+}

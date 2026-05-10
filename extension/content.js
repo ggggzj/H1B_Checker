@@ -1,7 +1,7 @@
 /**
  * content.js — H1B Checker Chrome Extension Content Script
  *
- * This file runs automatically inside every LinkedIn page the user visits.
+ * This file runs automatically on LinkedIn job pages (see manifest matches).
  * It is the bridge between the LinkedIn UI and the H1B Checker API.
  *
  * What it does:
