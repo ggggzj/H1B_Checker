@@ -1,0 +1,25 @@
+# When you publish a GitHub Release, attach a zip users can unzip and "Load unpacked".
+name: Release extension zip
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip extension folder (manifest at archive root)
+        run: |
+          cd extension
+          zip -r ../h1b-checker-extension.zip . -x "*.DS_Store" -x "**/.DS_Store"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: h1b-checker-extension.zip

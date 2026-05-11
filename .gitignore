@@ -11,3 +11,6 @@ __pycache__/
 
 # Data files (Excel files can be large)
 data/
+
+# Local extension build artifact (releases attach this via CI)
+h1b-checker-extension.zip
