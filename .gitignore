@@ -12,5 +12,9 @@ __pycache__/
 # Data files (Excel files can be large)
 data/
 
+# Local DB dumps and generated CSV exports (do not commit)
+h1b_data.sql
+output/
+
 # Local extension build artifact (releases attach this via CI)
 h1b-checker-extension.zip
