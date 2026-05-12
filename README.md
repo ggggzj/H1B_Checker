@@ -1,290 +1,167 @@
-# H1B Checker — H1B LCA data API
+# H1B Checker for LinkedIn Jobs
 
-A FastAPI + PostgreSQL backend for querying U.S. Department of Labor H1B LCA disclosure data.
+A free, open-source Chrome extension that adds an **H1B sponsorship badge** to every job card on LinkedIn, so you can tell at a glance whether a company has a history of sponsoring H1B visas — before you spend time tailoring an application.
 
-## Project layout
+The badge is one of two:
 
-```
-h1b-checker/
-├── process_data.py      ← Import script (read Excel, clean, load PostgreSQL)
-├── main.py              ← FastAPI app and routes
-├── models.py            ← SQLAlchemy models
-├── database.py          ← DB connection
-├── requirements.txt     ← Python dependencies
-├── .env                 ← Environment variables
-├── data/                ← Excel files
-└── README.md            ← This file
-```
+- **Green** `✓ Sponsors H1B` — the company has certified U.S. Department of Labor (DOL) H-1B LCA filings in our database.
+- **Red** `✗ No Sponsor` — we did not find recent LCA filings for that company.
+
+> All data comes from **public DOL H-1B LCA disclosure datasets**. The extension does **not** read your LinkedIn account, messages, cookies, or password.
 
 ---
 
-## Quick start
+## Install
 
-### Requirements
-- **Python 3.9+**
-- **PostgreSQL 12+** (installed and running)
-- **pip**
+### Option A — Chrome Web Store (recommended)
 
-### Step 1: Install dependencies
+The Web Store listing is currently under review. Once approved, you'll be able to install with one click:
 
-```bash
-cd h1b-checker
-pip install -r requirements.txt
-```
+> ⏳ _Pending review — link will be added here when published._
 
-### Step 2: Create the PostgreSQL database
+If you'd like to use the extension right now, follow **Option B** below.
 
-#### Option A: Command line
+### Option B — Install manually from GitHub (works today)
 
-```bash
-psql -U postgres
+You only need to do this once. It takes about 1 minute.
 
-# In psql:
-CREATE DATABASE h1b_checker;
-\q
-```
+1. **Download the extension package.**  
+   Click this link to download the latest build:  
+   👉 **<https://github.com/ggggzj/H1B_Checker/releases/latest/download/h1b-checker-extension.zip>**
 
-#### Option B: GUI (e.g. pgAdmin)
-1. Open pgAdmin  
-2. Create a new database named `h1b_checker`
+2. **Unzip the file.**  
+   Double-click `h1b-checker-extension.zip` to extract it. You should now have a folder named something like `h1b-checker-extension` that contains `manifest.json`, `content.js`, an `icons/` folder, etc.
 
-### Step 3: Configure `.env`
+   > Chrome cannot load a `.zip` file directly — it needs the **unzipped folder**.
 
-Edit `.env` with your connection string:
+3. **Open Chrome's extensions page.**  
+   Paste this into Chrome's address bar and press Enter:
 
-```env
-DATABASE_URL=postgresql://postgres:your_password@localhost:5432/h1b_checker
-```
+   ```
+   chrome://extensions
+   ```
 
-**Replace:**
-- `postgres` — PostgreSQL username  
-- `your_password` — PostgreSQL password  
-- `localhost` — host (often `localhost`)  
-- `5432` — port (default 5432)  
-- `h1b_checker` — database name  
+y4. **Turn on Developer mode.**  
+   Toggle the **Developer mode** switch in the top-right corner of the page to **ON**.
 
-### Step 4: Prepare Excel files
+5. **Load the extension.**  
+   Click **Load unpacked** (top-left) and select the **unzipped folder** from step 2.
 
-1. Download H1B LCA data (Excel) from the [U.S. Department of Labor](https://www.dol.gov/agencies/eta/foreign-labor/performance).  
-2. Place `.xlsx` files under `./data/`.
+6. **You're done.**  
+   You should see a new entry **H1B Checker for LinkedIn Jobs** in your extensions list. Make sure its toggle is **ON** (blue).
 
-```bash
-ls -la data/
-# Example:
-# h1b_data_2023.xlsx
-# h1b_data_2024.xlsx
-```
+### Also works on (Chromium-based browsers)
 
-### Step 5: Import data
+The same steps work on browsers built on Chromium:
 
-```bash
-python process_data.py
-```
-
-**Example output (aligned with the English script):**
-
-```
-============================================================
-🚀 H1B data processing script
-============================================================
-📂 Found 2 xlsx file(s):
-...
-✅ All steps completed.
-============================================================
-```
-
-### Step 6: Run the API
-
-```bash
-python main.py
-```
-
-Or with auto-reload:
-
-```bash
-uvicorn main:app --reload
-```
-
-**Example:**
-
-```
-INFO:     Uvicorn running on http://127.0.0.1:8000
-INFO:     Press CTRL+C to quit
-```
+- **Microsoft Edge** — go to `edge://extensions` and enable developer mode.
+- **Brave** — go to `brave://extensions`.
+- **Arc / Opera / Vivaldi** — open the extensions page in the menu and enable developer mode.
 
 ---
 
-## API endpoints
+## How to use
 
-### 1. Check one company
+1. Open any LinkedIn jobs page, for example:  
+   <https://www.linkedin.com/jobs/>  
+   or any search result URL like  
+   <https://www.linkedin.com/jobs/search/?keywords=software%20engineer>
 
-**Request:**
-```bash
-curl "http://localhost:8000/check?company=Google"
-```
+2. Browse jobs as you normally would. Each job card will be tagged with a colored badge:
 
-**Response:**
-```json
-{
-  "found": true,
-  "employer_name": "GOOGLE LLC",
-  "h1b_count": 8420,
-  "sponsors_h1b": true
-}
-```
+   | Badge | Meaning |
+   |---|---|
+   | 🟢 `✓ Sponsors H1B` | The company has certified DOL LCA filings (likely sponsors H1B). |
+   | 🔴 `✗ No Sponsor` | We did not find recent LCA filings for that company. |
 
-### 2. Search companies (fuzzy)
+3. Scroll down — as LinkedIn loads more jobs, badges appear automatically. No clicks or login required.
 
-**Request:**
-```bash
-curl "http://localhost:8000/search?q=amazon&limit=5"
-```
-
-**Response:**
-```json
-{
-  "results": [
-    {
-      "employer_name": "AMAZON.COM INC",
-      "h1b_count": 7850
-    },
-    {
-      "employer_name": "AMAZON CORPORATE LLC",
-      "h1b_count": 2300
-    }
-  ],
-  "total": 2
-}
-```
-
-### 3. Stats
-
-**Request:**
-```bash
-curl "http://localhost:8000/stats"
-```
-
-If not implemented, this route may return 404 until you add it.
-
-### 4. Health
-
-**Request:**
-```bash
-curl "http://localhost:8000/health"
-```
-
-**Response:**
-```json
-{
-  "status": "healthy",
-  "service": "H1B Checker API"
-}
-```
+> **Tip:** The badge is a **signal, not a guarantee.** Some companies sponsor occasionally and may not appear in our snapshot of the data. Always cross-check on the company's careers page before applying.
 
 ---
 
-## Interactive API docs
+## Updating the extension
 
-After the server starts:
+Whenever a new version is released:
 
-- **Swagger UI**: http://localhost:8000/docs  
-- **ReDoc**: http://localhost:8000/redoc  
+1. Download the new `h1b-checker-extension.zip` from <https://github.com/ggggzj/H1B_Checker/releases/latest>.
+2. Unzip it (you can overwrite the old folder).
+3. Open `chrome://extensions`, find **H1B Checker for LinkedIn Jobs**, and click the small **circular arrow** (refresh) icon on that card.
 
----
-
-## Database schema
-
-```sql
-CREATE TABLE employers (
-    id SERIAL PRIMARY KEY,
-    employer_name TEXT UNIQUE NOT NULL,
-    h1b_count INTEGER,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-**Columns:**
-- `id` — primary key  
-- `employer_name` — unique company name  
-- `h1b_count` — certified H1B count (aggregated)  
-- `last_updated` — last update time  
+Once the extension is available on the Chrome Web Store, updates will be automatic and you can skip these steps.
 
 ---
 
-## Data flow
+## Uninstall
 
-```
-Excel files
-    ↓
-[process_data.py]
-    ↓
-Clean & aggregate
-    ↓
-PostgreSQL
-    ↓
-[FastAPI server]
-    ↓
-[API routes] → clients
-```
+Open `chrome://extensions`, find **H1B Checker for LinkedIn Jobs**, and click **Remove**.
+
+---
+
+## Privacy
+
+- The content script only runs on `https://www.linkedin.com/jobs/*`.
+- The extension only sends **company names that are already visible on the page** to our API for lookup — over HTTPS.
+- The extension does **not** read your LinkedIn profile, messages, cookies, password, résumé, or browsing history.
+- The extension does **not** sell data and does **not** show ads.
+
+Full policy: <https://ggggzj.github.io/H1B_Checker/privacy-policy.html>
+
+---
+
+## Troubleshooting
+
+### I don't see any badges on LinkedIn
+
+1. Make sure you are on a URL that starts with `https://www.linkedin.com/jobs/` (the badges only render on job pages, not on the LinkedIn feed or profile).
+2. Open `chrome://extensions` and make sure **H1B Checker for LinkedIn Jobs** is **enabled** (toggle is blue).
+3. Refresh the LinkedIn jobs tab.
+4. Wait a couple of seconds after scrolling — the extension waits briefly to avoid hammering the API.
+
+### Chrome shows "Manifest file is missing or unreadable"
+
+You selected the `.zip` file instead of the unzipped folder. Unzip it first, then re-select the folder that contains `manifest.json` at its top level.
+
+### A company I know sponsors H1B shows "No Sponsor"
+
+LinkedIn job cards sometimes display a parent company, subsidiary, or marketing brand whose legal name doesn't match the entity that files LCAs. Please open a GitHub issue with the LinkedIn company name and we'll add a mapping:  
+<https://github.com/ggggzj/H1B_Checker/issues>
+
+### A company shows "Sponsors H1B" but I want to verify
+
+You can confirm directly on the U.S. Department of Labor's public site:  
+<https://www.dol.gov/agencies/eta/foreign-labor/performance>
 
 ---
 
 ## FAQ
 
-### Q1: `DATABASE_URL not found`
-**Fix:** Put `.env` in the project root and set `DATABASE_URL` correctly.
+**Is this affiliated with LinkedIn or the U.S. government?**  
+No. This is an independent open-source project. LinkedIn is a registered trademark of LinkedIn Corporation. We use the official DOL LCA dataset, which is public.
 
-### Q2: PostgreSQL connection timeout
-**Fix:**
-1. Confirm PostgreSQL is running: `psql -U postgres -c "SELECT 1"`  
-2. Check host, port, user, and password in `.env`
+**Is it free?**  
+Yes. The extension is free and open source under the MIT License.
 
-### Q3: Excel read errors
-**Fix:**
-1. Ensure valid `.xlsx` (open in Excel if unsure)  
-2. Check permissions: `ls -la data/`  
-3. Test pandas: `python -c "import pandas as pd; df = pd.read_excel('data/file.xlsx'); print(df.shape)"`
+**Does it work on Safari / Firefox?**  
+Not yet. It's a Chromium extension; works on Chrome, Edge, Brave, Arc, Opera, and Vivaldi.
 
-### Q4: Re-import from scratch
-**Fix:**
-```bash
-psql -U postgres -d h1b_checker -c "DROP TABLE IF EXISTS employers;"
-python process_data.py
-```
+**Will it slow down LinkedIn?**  
+No noticeable impact. The extension caches results in memory so it queries the API at most once per company per page load.
 
 ---
 
-## Performance notes
+## For developers
 
-- **Import:** ~30–60 seconds per million rows (hardware-dependent)  
-- **Queries:** typically milliseconds (indexed names)  
-- **Suggested:** PostgreSQL 12+ and 4GB+ RAM  
+The repo also contains the backend (FastAPI + PostgreSQL) that powers the API:
 
----
+- **Backend API docs and setup** → [`docs/BACKEND.md`](docs/BACKEND.md)
+- **Extension source and packaging** → [`extension/README.md`](extension/README.md)
+- **Build the zip locally** → run `./scripts/package-extension.sh` from the repo root.
 
-## Production hints
-
-1. **Secrets:** use a secrets manager; never commit real passwords  
-2. **CORS:** configure if browsers call from another origin  
-3. **Auth:** add API keys or OAuth if needed  
-4. **Logging:** centralize (e.g. ELK)  
-5. **Monitoring:** use APM where appropriate  
-
----
-
-## Support checklist
-
-1. Read the error message  
-2. Verify `.env`  
-3. Confirm PostgreSQL is running  
-4. Re-read the FAQ above  
+Pull requests and issues are welcome.
 
 ---
 
 ## License
 
-MIT License
-
----
-
-Happy building.
+MIT License. See repository for details.
