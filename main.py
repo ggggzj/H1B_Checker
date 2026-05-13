@@ -131,7 +131,7 @@ def get_embedding_cached(text_key: str) -> Optional[list[float]]:
 def semantic_search(
     query: str,
     db: Session,
-    similarity_threshold: float = 0.75,
+    similarity_threshold: float = 0.65,
     top_k: int = 3,
 ) -> Tuple[Optional[Employer], float, bool]:
     """

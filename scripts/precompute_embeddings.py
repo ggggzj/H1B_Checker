@@ -191,13 +191,14 @@ def ensure_embedding_schema() -> None:
     Matches employer_embedding.sql so local DBs created before that migration
     still work when running this script. Safe to re-run (IF NOT EXISTS).
     """
-    print("📦 检查 pgvector 与 employers.embedding 列...")
+    print("📦 Checking pgvector extension and employers.embedding column...")
     try:
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     except Exception as e:
         print(f"   ⚠️  CREATE EXTENSION vector: {e}")
-        print("      （若扩展已存在或当前角色无权限，可忽略；若后续 ALTER 失败则需超级用户在库中执行。）")
+        print("      (Safe to ignore if the extension already exists or the role lacks permission;")
+        print("       if the ALTER below also fails, run it as a superuser instead.)")
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -208,11 +209,11 @@ def ensure_embedding_schema() -> None:
             )
     except Exception as e:
         raise SystemExit(
-            f"ERROR: 无法添加列 employers.embedding: {e}\n"
-            "  请在数据库中手动执行仓库根目录的 employer_embedding.sql，"
-            "或使用有权限的角色安装 vector 扩展。"
+            f"ERROR: failed to add column employers.embedding: {e}\n"
+            "  Run employer_embedding.sql (at repo root) manually against the database,\n"
+            "  or install the vector extension using a privileged role."
         ) from e
-    print("   ✅ employers.embedding 已就绪（或原本已存在）。")
+    print("   ✅ employers.embedding is ready (created or already existed).")
     print()
 
 
@@ -222,12 +223,12 @@ def _print_banner(total: int, done: int, pending: int) -> None:
     est_cost = _estimate_cost_usd(est_tokens)
     print()
     print("=" * 60)
-    print("🚀 Embedding 预计算脚本")
+    print("🚀 Embedding precompute script")
     print("=" * 60)
-    print(f"   总雇主数: {total:,}")
-    print(f"   已完成: {done:,}")
-    print(f"   待处理: {pending:,}")
-    print(f"   预计成本: ${est_cost:.4f}")
+    print(f"   Total employers:   {total:,}")
+    print(f"   Already embedded:  {done:,}")
+    print(f"   Pending:           {pending:,}")
+    print(f"   Estimated cost:    ${est_cost:.4f}")
     print("=" * 60)
     print()
 
@@ -247,13 +248,13 @@ def create_hnsw_index() -> None:
         WHERE (embedding IS NOT NULL)
         """
     )
-    print("🔧 创建 HNSW 索引...")
+    print("🔧 Creating HNSW index...")
     try:
         with engine.begin() as conn:
             conn.execute(ddl)
-        print("   ✅ 索引创建完成")
+        print("   ✅ Index created")
     except Exception as e:
-        print(f"   ⚠️  索引创建失败（检查 pgvector 版本是否支持 HNSW）: {e}")
+        print(f"   ⚠️  Failed to create index (check pgvector version for HNSW support): {e}")
 
 
 def run() -> None:
@@ -270,11 +271,11 @@ def run() -> None:
         _print_banner(total, done_initial, pending_initial)
 
         if pending_initial == 0:
-            print("没有待处理的雇主（embedding 均已填充）。跳过 API 调用。")
+            print("No pending employers (every row already has an embedding). Skipping OpenAI calls.")
             create_hnsw_index()
             print()
             print("=" * 60)
-            print("✅ 全部完成！（无需写入 embedding）")
+            print("✅ All done! (no embeddings needed to be written)")
             print("=" * 60)
             return
 
@@ -290,7 +291,7 @@ def run() -> None:
 
             batch_no += 1
             names = [e.employer_name for e in batch]
-            print(f"📊 Batch {batch_no} ({len(batch)} 家公司):")
+            print(f"📊 Batch {batch_no} ({len(batch)} employers):")
 
             vectors, batch_tokens = _embed_batch_openai(client, names)
             cumulative_tokens += batch_tokens
@@ -299,21 +300,21 @@ def run() -> None:
             saved = _persist_embeddings(session, batch, vectors)
 
             cumulative_processed += saved
-            print(f"   💾 已提交 Batch {batch_no}（成功写入 {saved} / {len(batch)}）")
+            print(f"   💾 Committed Batch {batch_no} ({saved} / {len(batch)} rows written)")
             print(
-                f"   📈 总进度: {cumulative_processed:,} / {pending_initial:,} "
+                f"   📈 Overall progress: {cumulative_processed:,} / {pending_initial:,} "
                 f"({100.0 * cumulative_processed / max(pending_initial, 1):.1f}%)"
             )
-            print(f"   💰 累计成本（按 token 估算）: ${cumulative_cost:.4f}")
+            print(f"   💰 Cumulative cost (estimated from tokens): ${cumulative_cost:.4f}")
             print()
 
         create_hnsw_index()
         print()
         print("=" * 60)
-        print("✅ 全部完成！")
-        print(f"   总处理（本运行成功写入）: {cumulative_processed:,} 家公司")
-        print(f"   总 tokens（本运行 API 上报）: {cumulative_tokens:,}")
-        print(f"   总成本（估算）: ${cumulative_cost:.4f}")
+        print("✅ All done!")
+        print(f"   Embeddings written this run: {cumulative_processed:,} employers")
+        print(f"   Tokens used this run (reported by OpenAI): {cumulative_tokens:,}")
+        print(f"   Estimated cost this run: ${cumulative_cost:.4f}")
         print("=" * 60)
 
     finally:
