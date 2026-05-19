@@ -31,7 +31,7 @@ For users who prefer not to wait for Web Store review, or who want to inspect th
 | File | Role |
 |------|------|
 | `manifest.json` | MV3 manifest, minimal permissions |
-| `content.js` | DOM helpers, `fetch` to `/check` |
+| `content.js` | DOM helpers, `fetch` to `/check`, remote selectors via `/config` |
 | `style.css` | Badge styles |
 | `icons/` | `16`, `32`, `48`, `128` PNG assets |
 | `privacy-policy.html` | Local copy of the privacy policy (host a public copy for the Web Store) |
@@ -52,3 +52,7 @@ For users who prefer not to wait for Web Store review, or who want to inspect th
 
 - Replace `author` and `homepage_url` in `manifest.json` if your GitHub account or repo URL differs.
 - Point `API_URL` in `content.js` to your deployment.
+
+## LinkedIn DOM changes
+
+The extension resolves companies primarily from `linkedin.com/company/{slug}` URLs (stable across CSS class changes). Backup CSS selectors are served via `GET /config` and cached locally. If LinkedIn changes URL structure or job-card layout, update `EXTENSION_*_SELECTORS` in `main.py` and redeploy the API — users do not need to update the extension for selector-only fixes. Failed extractions are logged via `POST /report-selector-miss`.

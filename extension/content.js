@@ -1,113 +1,222 @@
 /**
  * content.js — H1B Checker Chrome Extension Content Script
  *
- * This file runs automatically on LinkedIn job pages (see manifest matches).
- * It is the bridge between the LinkedIn UI and the H1B Checker API.
+ * Runs automatically on LinkedIn job pages. No user action required.
  *
- * What it does:
- * 1. Finds all job cards on the current LinkedIn jobs page
- * 2. Extracts the company name from each card
- * 3. Calls the Railway API to check if that company sponsors H1B
- * 4. Injects a colored badge ("✓ Sponsors H1B" or "✗ No Sponsor") onto each card
- * 5. Watches for new cards that LinkedIn loads dynamically (infinite scroll)
- *
- * Language: JavaScript (runs in Chrome browser, not Node.js or Python)
- * Triggered by: manifest.json → content_scripts → matches LinkedIn URLs
+ * Resilience strategy (in order):
+ *   1. Company identity from linkedin.com/company/{slug} URLs (stable across CSS changes)
+ *   2. Job cards via [data-job-id] or server-provided selectors
+ *   3. Infer job cards from company links when selectors miss
+ *   4. Remote /config hot-reloads backup CSS selectors without a store update
  */
 
-// Base URL of the deployed FastAPI backend on Railway
-// All API calls will be made to this domain
 const API_URL = 'https://h1bchecker-production.up.railway.app';
+const CONFIG_STORAGE_KEY = 'h1bExtensionConfig';
 
-// In-memory cache(localStorage): stores {companyName (lowercase): {sponsors, count}} results
-// Prevents making duplicate API calls for the same company on one page load
+// Matches linkedin.com/company/acme-corp/... — product URL, not hashed CSS classes.
+const LINKEDIN_COMPANY_PATH = /linkedin\.com\/company\/([^/?#]+)/i;
+
+const DEFAULT_COMPANY_SELECTORS = [
+  '.artdeco-entity-lockup__subtitle div[dir="ltr"]',
+  '.artdeco-entity-lockup__subtitle',
+  '.job-card-container__company-name',
+  '.base-search-card__subtitle',
+  '.base-card__subtitle',
+  '.base-main-card__subtitle',
+];
+
+const DEFAULT_JOB_CARD_SELECTORS = [
+  '[data-job-id]',
+  'li.jobs-search-results__list-item',
+  '.job-card-list__entity-lockup',
+  '.jobs-search-results-list__list-item',
+];
+
+let companySelectors = [...DEFAULT_COMPANY_SELECTORS];
+let jobCardSelectors = [...DEFAULT_JOB_CARD_SELECTORS];
+
 const cache = new Map();
+const reportedMissCards = new WeakSet();
+const cardCompanyAnchors = new WeakMap();
 
 const MAX_NAME_ATTEMPTS = 8;
+const FETCH_TIMEOUT_MS = 8000;
+const CONFIG_FETCH_TIMEOUT_MS = 5000;
+const CONFIG_REFRESH_MS = 30 * 60 * 1000;
 
 
 // ─────────────────────────────────────────────
-// FUNCTION 1: processJobs
-// Main orchestrator — finds cards, gets company name, fetches API, adds badge
+// Remote config
 // ─────────────────────────────────────────────
-async function processJobs() {
-  // Find all elements with data-job-id on the page
-  // Then keep only the OUTERMOST ones — filter out any element whose
-  // parent also has data-job-id, which would mean it is a nested duplicate
-  // of the same logical card. This prevents adding multiple badges to the
-  // same visible card when LinkedIn nests [data-job-id] elements inside each other.
-  const allCards = document.querySelectorAll('[data-job-id]');
-  const jobCards = [...allCards].filter(
-    card => !card.parentElement?.closest('[data-job-id]')
-  );
 
-  // Loop over every job card found on the page
-  for (const card of jobCards) {
-    if (card.dataset.h1bDone === '1' || card.dataset.h1bDone === 'abandon') continue;
+function applySelectorList(list, fallback, assign) {
+  if (!Array.isArray(list) || list.length === 0) return false;
+  if (!list.every((s) => typeof s === 'string' && s.length > 0 && s.length < 200)) {
+    return false;
+  }
+  assign([...list]);
+  return true;
+}
 
-    const companyName = getCompanyName(card);
+function applyExtensionConfig(config) {
+  if (!config?.selectors) return false;
+  let updated = false;
+  if (applySelectorList(config.selectors.company_name, DEFAULT_COMPANY_SELECTORS, (v) => {
+    companySelectors = v;
+  })) {
+    updated = true;
+  }
+  if (applySelectorList(config.selectors.job_card, DEFAULT_JOB_CARD_SELECTORS, (v) => {
+    jobCardSelectors = v;
+  })) {
+    updated = true;
+  }
+  return updated;
+}
 
-    if (!companyName) {
-      const n = parseInt(card.dataset.h1bNameAttempts || '0', 10) + 1;
-      card.dataset.h1bNameAttempts = String(n);
-      if (n >= MAX_NAME_ATTEMPTS) {
-        card.dataset.h1bDone = 'abandon';
-      }
-      continue;
+function readCachedConfig() {
+  return new Promise((resolve) => {
+    if (!chrome.storage?.local) {
+      resolve(null);
+      return;
+    }
+    chrome.storage.local.get([CONFIG_STORAGE_KEY], (result) => {
+      resolve(result[CONFIG_STORAGE_KEY] || null);
+    });
+  });
+}
+
+function writeCachedConfig(config) {
+  if (!chrome.storage?.local) return;
+  chrome.storage.local.set({ [CONFIG_STORAGE_KEY]: config });
+}
+
+async function loadConfig() {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), CONFIG_FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${API_URL}/config`, { signal: controller.signal });
+    if (!response.ok) {
+      console.warn('[H1B] Config fetch HTTP error:', response.status);
+      return false;
     }
 
-    card.dataset.h1bNameAttempts = '0';
-
-    const sponsorInfo = await getH1BInfo(companyName);
-
-    if (!sponsorInfo) continue;
-
-    addBadge(card, sponsorInfo);
-    card.dataset.h1bDone = '1';
+    const config = await response.json();
+    if (applyExtensionConfig(config)) {
+      writeCachedConfig(config);
+      console.log('[H1B] Config loaded, version:', config.version);
+      return true;
+    }
+    console.warn('[H1B] Config response missing valid selectors');
+    return false;
+  } catch (error) {
+    console.warn('[H1B] Config fetch failed, using bundled defaults:', error);
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
   }
+}
+
+async function bootstrapConfig() {
+  const cached = await readCachedConfig();
+  if (cached) applyExtensionConfig(cached);
+
+  loadConfig().then((updated) => {
+    if (updated) processJobs();
+  });
+
+  setInterval(() => {
+    loadConfig().then((updated) => {
+      if (updated) processJobs();
+    });
+  }, CONFIG_REFRESH_MS);
 }
 
 
 // ─────────────────────────────────────────────
-// FUNCTION 2: getCompanyName
-// Reads the company name text from a single job card element
+// Company extraction (URL-first)
 // ─────────────────────────────────────────────
+
 function _trimCompanyText(s) {
   if (!s) return null;
   const t = String(s).replace(/\s+/g, ' ').trim();
   if (!t || t.length > 200) return null;
+  if (/^\d+\s+school alumni/i.test(t)) return null;
   return t;
 }
 
-function getCompanyName(card) {
-  const pick = (el) => _trimCompanyText(el?.textContent);
+function parseLinkedInCompanySlug(url) {
+  if (!url) return null;
+  const m = String(url).match(LINKEDIN_COMPANY_PATH);
+  if (!m) return null;
+  const slug = decodeURIComponent(m[1]).trim();
+  if (!slug || slug === 'unavailable') return null;
+  return slug;
+}
 
-  // Job detail / some list layouts — entity lockup subtitle
-  let el = card.querySelector('.artdeco-entity-lockup__subtitle div[dir="ltr"]');
-  if (el) return pick(el);
+function slugToLookupName(slug) {
+  return slug.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+}
 
-  el = card.querySelector('.artdeco-entity-lockup__subtitle');
-  if (el) return pick(el);
+function getLinkHref(node) {
+  return (
+    node.href ||
+    node.getAttribute('href') ||
+    node.getAttribute('data-original-url') ||
+    ''
+  );
+}
 
-  // Jobs search-results list (common 2025–2026)
-  el = card.querySelector('.job-card-container__company-name');
-  if (el) {
-    const name = pick(el);
-    if (name) return name;
+function getCompanyLinkCandidates(card) {
+  const nodes = card.querySelectorAll(
+    "a[href*='/company/'], [data-original-url*='/company/']"
+  );
+  const candidates = [];
+
+  for (const node of nodes) {
+    const href = getLinkHref(node);
+    const slug = parseLinkedInCompanySlug(href);
+    if (!slug) continue;
+    candidates.push({
+      node,
+      slug,
+      text: _trimCompanyText(node.textContent),
+      href,
+    });
   }
 
-  el = card.querySelector('.base-search-card__subtitle');
-  if (el) return pick(el);
+  return candidates;
+}
 
-  // Secondary line under job title in compact cards
-  el = card.querySelector('.base-card__subtitle, .base-main-card__subtitle');
-  if (el) return pick(el);
+/**
+ * Resolve company name for API lookup. Prefers visible link text, then URL slug.
+ */
+function getCompanyLookup(card) {
+  const candidates = getCompanyLinkCandidates(card);
 
-  // Company profile link text inside the card
-  const link = card.querySelector('a[href*="/company/"]');
-  if (link) {
-    const name = pick(link);
-    if (name) return name;
+  for (const c of candidates) {
+    if (c.text) {
+      cardCompanyAnchors.set(card, c.node);
+      return c.text;
+    }
+  }
+
+  for (const c of candidates) {
+    const fromSlug = slugToLookupName(c.slug);
+    if (fromSlug) {
+      cardCompanyAnchors.set(card, c.node);
+      return fromSlug;
+    }
+  }
+
+  for (const selector of companySelectors) {
+    const el = card.querySelector(selector);
+    const name = _trimCompanyText(el?.textContent);
+    if (name) {
+      cardCompanyAnchors.set(card, el);
+      return name;
+    }
   }
 
   return null;
@@ -115,124 +224,274 @@ function getCompanyName(card) {
 
 
 // ─────────────────────────────────────────────
-// FUNCTION 3: getH1BInfo
-// Calls the Railway API to look up a company's H1B sponsorship history
+// Job card discovery
 // ─────────────────────────────────────────────
-async function getH1BInfo(companyName) {
-  // Normalize the key to lowercase so "Google" and "google" hit the same cache entry
-  const key = companyName.toLowerCase();
 
-  // Return cached result immediately if we already looked up this company
-  if (cache.has(key)) {
-    return cache.get(key);
-  }
+function outermostDataJobIdCard(el) {
+  const card = el.matches?.('[data-job-id]') ? el : el.closest?.('[data-job-id]');
+  if (!card) return null;
+  if (card.parentElement?.closest('[data-job-id]')) return null;
+  return card;
+}
 
-  try {
-    // Make a GET request to the /check endpoint
-    // encodeURIComponent handles special characters like "&" or "+" in company names
-    // e.g. "Ernst & Young" → "Ernst%20%26%20Young"
-    const response = await fetch(`${API_URL}/check?company=${encodeURIComponent(companyName)}`);
+function findJobCardsFromSelectors() {
+  const seen = new Set();
+  const cards = [];
 
-    if (!response.ok) {
-      console.error('H1B API HTTP error:', response.status, await response.text());
-      return null;
+  for (const selector of jobCardSelectors) {
+    let nodes;
+    try {
+      nodes = document.querySelectorAll(selector);
+    } catch {
+      continue;
     }
 
-    // Parse the JSON response body
-    // Expected shape: { sponsors_h1b: true/false, h1b_count: 8810, ... }
-    const data = await response.json();
+    for (const el of nodes) {
+      let card = el;
+      if (selector === '[data-job-id]') {
+        card = outermostDataJobIdCard(el);
+        if (!card) continue;
+      }
 
-    // Extract only the fields we need and store in a clean object
-    const result = {
-      sponsors: data.sponsors_h1b, // boolean: does the company sponsor H1B?
-      count: data.h1b_count        // number: how many certified LCA filings
-    };
-
-    // Save result to cache so we don't call the API again for this company
-    cache.set(key, result);
-    return result;
-
-  } catch (error) {
-    // If the fetch fails (network error, API down, etc.), log and return null
-    // Returning null tells processJobs() to skip this card silently
-    console.error('H1B API error:', error);
-    return null;
+      if (seen.has(card)) continue;
+      seen.add(card);
+      cards.push(card);
+    }
   }
+
+  return cards;
+}
+
+function findJobCardContainerFromLink(link) {
+  let el = link;
+
+  for (let depth = 0; depth < 14; depth++) {
+    if (!el.parentElement) break;
+    el = el.parentElement;
+
+    const byId = outermostDataJobIdCard(el);
+    if (byId) return byId;
+
+    const companyLinks = el.querySelectorAll("a[href*='/company/']");
+    const rect = el.getBoundingClientRect?.();
+    const h = rect?.height ?? 0;
+
+    if (companyLinks.length >= 1 && h > 48 && h < 600) {
+      const parent = el.parentElement;
+      const parentLinks = parent?.querySelectorAll("a[href*='/company/']")?.length ?? 0;
+      if (parentLinks > 1) return el;
+      if (parentLinks === 1 && (parent?.getBoundingClientRect?.().height ?? 0) < h * 2.5) {
+        continue;
+      }
+      return el;
+    }
+  }
+
+  return (
+    link.closest('li, article, [role="listitem"]') ||
+    link.parentElement?.parentElement ||
+    null
+  );
+}
+
+function findJobCardsFromCompanyLinks() {
+  const seen = new Set();
+  const cards = [];
+  const links = document.querySelectorAll(
+    "a[href*='/company/'], [data-original-url*='/company/']"
+  );
+
+  for (const link of links) {
+    if (!parseLinkedInCompanySlug(getLinkHref(link))) continue;
+
+    const card = findJobCardContainerFromLink(link);
+    if (!card || seen.has(card)) continue;
+
+    seen.add(card);
+    cards.push(card);
+  }
+
+  return cards;
+}
+
+function findJobCards() {
+  const fromSelectors = findJobCardsFromSelectors();
+  if (fromSelectors.length > 0) return fromSelectors;
+  return findJobCardsFromCompanyLinks();
 }
 
 
 // ─────────────────────────────────────────────
-// FUNCTION 4: addBadge
-// Creates and inserts the H1B status badge into a job card
+// processJobs / API / badge
 // ─────────────────────────────────────────────
+
+async function processJobs() {
+  const jobCards = findJobCards();
+  const pending = [];
+
+  for (const card of jobCards) {
+    const status = card.dataset.h1bDone;
+    if (status === '1' || status === 'abandon' || status === 'pending') continue;
+
+    const companyName = getCompanyLookup(card);
+
+    if (!companyName) {
+      const n = parseInt(card.dataset.h1bNameAttempts || '0', 10) + 1;
+      card.dataset.h1bNameAttempts = String(n);
+      if (n >= MAX_NAME_ATTEMPTS) {
+        card.dataset.h1bDone = 'abandon';
+        reportSelectorMiss(card);
+      }
+      continue;
+    }
+
+    card.dataset.h1bNameAttempts = '0';
+    card.dataset.h1bDone = 'pending';
+    pending.push({ card, companyName });
+  }
+
+  if (pending.length === 0) return;
+
+  await Promise.all(
+    pending.map(async ({ card, companyName }) => {
+      const sponsorInfo = await getH1BInfo(companyName);
+      if (!sponsorInfo) {
+        if (card.dataset.h1bDone === 'pending') delete card.dataset.h1bDone;
+        return;
+      }
+      addBadge(card, sponsorInfo);
+      card.dataset.h1bDone = '1';
+    })
+  );
+}
+
+function reportSelectorMiss(card) {
+  if (reportedMissCards.has(card)) return;
+  reportedMissCards.add(card);
+
+  fetch(`${API_URL}/report-selector-miss`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      html: card.innerHTML.slice(0, 300),
+      url: window.location.href,
+      selectors_tried: {
+        company: companySelectors,
+        job_card: jobCardSelectors,
+      },
+    }),
+  }).catch(() => {});
+}
+
+function getH1BInfo(companyName) {
+  const key = companyName.toLowerCase();
+
+  if (cache.has(key)) {
+    return cache.get(key);
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  const promise = (async () => {
+    try {
+      const response = await fetch(
+        `${API_URL}/check?company=${encodeURIComponent(companyName)}`,
+        { signal: controller.signal }
+      );
+
+      if (!response.ok) {
+        console.error('H1B API HTTP error:', response.status, await response.text());
+        cache.delete(key);
+        return null;
+      }
+
+      const data = await response.json();
+      return {
+        sponsors: data.sponsors_h1b,
+        count: data.h1b_count,
+      };
+    } catch (error) {
+      console.error('H1B API error:', error);
+      cache.delete(key);
+      return null;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  })();
+
+  cache.set(key, promise);
+  return promise;
+}
+
 function addBadge(card, info) {
-  // Do nothing if a badge already exists on this card (safety check)
   if (card.querySelector('.h1b-badge')) return;
 
-  // Create a new <div> element that will become the visible badge
   const badge = document.createElement('div');
-
-  // Assign CSS classes: "h1b-badge" always, plus either "sponsor-yes" or "sponsor-no"
-  // These classes are defined in style.css and control the green/red colors
   badge.className = `h1b-badge ${info.sponsors ? 'sponsor-yes' : 'sponsor-no'}`;
+  badge.innerHTML = info.sponsors ? '✓ Sponsors H1B' : '✗ No Sponsor';
 
-  // Set the badge text based on sponsorship status
-  // ✓ green badge for sponsors, ✗ red badge for non-sponsors
-  badge.innerHTML = info.sponsors
-    ? '✓ Sponsors H1B'
-    : '✗ No Sponsor';
+  const anchor =
+    cardCompanyAnchors.get(card) ||
+    card.querySelector("a[href*='/company/']") ||
+    card.querySelector('[class*="company"]');
 
-  // Try to insert the badge next to the company name element inside the card
-  const companyElem = card.querySelector('[class*="company"]');
-  if (companyElem && companyElem.parentElement) {
-    // Append badge as the last child of the company element's parent
-    companyElem.parentElement.appendChild(badge);
+  if (anchor?.parentElement) {
+    anchor.parentElement.appendChild(badge);
   } else {
-    // Fallback: insert badge at the very top of the card if no company element found
     card.insertBefore(badge, card.firstChild);
   }
 }
 
 
 // ─────────────────────────────────────────────
-// STARTUP: run processJobs when the page is ready
+// Startup & DOM observer
 // ─────────────────────────────────────────────
 
-// If the page HTML is still being parsed, wait for it to finish before running
-// If the page is already loaded (e.g. extension was just installed), run immediately
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', processJobs);
-} else {
+function scheduleInitialPasses() {
   processJobs();
+  setTimeout(processJobs, 300);
+  setTimeout(processJobs, 800);
+  setTimeout(processJobs, 1800);
+  setTimeout(processJobs, 3500);
 }
 
+function start() {
+  bootstrapConfig();
+  scheduleInitialPasses();
+}
 
-// ─────────────────────────────────────────────
-// MUTATION OBSERVER: watch for new job cards loaded by infinite scroll
-// ─────────────────────────────────────────────
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', start);
+} else {
+  start();
+}
 
-// LinkedIn is a single-page app — when the user scrolls, new job cards are
-// added to the DOM without a full page reload. We need to detect this and
-// process the new cards automatically.
-
-// debounceTimer holds the ID of the pending setTimeout so we can cancel it
 let debounceTimer = null;
 
-// MutationObserver fires a callback every time child elements are added/removed
-const observer = new MutationObserver(() => {
-  // Cancel any previously scheduled call — we only want to run once after
-  // the DOM has settled, not on every single individual DOM mutation
-  clearTimeout(debounceTimer);
+function mutationLooksLikeJobContent(mutations) {
+  for (const m of mutations) {
+    for (const node of m.addedNodes) {
+      if (node.nodeType !== 1) continue;
+      if (node.matches?.('[data-job-id]')) return true;
+      if (node.querySelector?.('[data-job-id]')) return true;
+      if (node.matches?.("a[href*='/company/']")) return true;
+      if (node.querySelector?.("a[href*='/company/']")) return true;
+    }
+  }
+  return false;
+}
 
-  // Schedule processJobs to run 800ms after the last DOM change
-  // This prevents hammering the API when LinkedIn updates many elements at once
-  debounceTimer = setTimeout(processJobs, 800);
+const observer = new MutationObserver((mutations) => {
+  if (mutationLooksLikeJobContent(mutations)) {
+    processJobs();
+  }
+
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(processJobs, 300);
 });
 
-// Start observing the entire page body for structural changes
-// childList: true  — watch for elements being added or removed
-// subtree: true    — watch all descendants, not just direct children
 observer.observe(document.body, {
   childList: true,
-  subtree: true
+  subtree: true,
 });

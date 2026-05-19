@@ -22,6 +22,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import NullPool
 
 
@@ -45,7 +46,56 @@ if not DATABASE_URL:
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False, poolclass=NullPool)
+
+def _safe_db_target(url: str) -> str:
+    """Return host:port/db from the URL with no credentials, for diagnostics."""
+    try:
+        from urllib.parse import urlparse
+
+        p = urlparse(url)
+        host = p.hostname or "?"
+        port = p.port or "?"
+        db = (p.path or "").lstrip("/") or "?"
+        return f"{host}:{port}/{db}"
+    except Exception:
+        return "(unparseable)"
+
+
+print(f"🔗 Connecting to {_safe_db_target(DATABASE_URL)}")
+# Short connect_timeout so timeouts fail fast (default would hang for a long time).
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    echo=False,
+    poolclass=NullPool,
+    connect_args={"connect_timeout": 10},
+)
+
+
+def probe_database_connection() -> None:
+    """
+    Fail fast with actionable hints if the laptop cannot reach Railway Postgres.
+
+    Common causes: wrong URL (internal *.railway.internal), corporate firewall,
+    stale TCP proxy host/port, or regional routing issues.
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except OperationalError as e:
+        target = _safe_db_target(DATABASE_URL)
+        print("\n❌ Could not connect to PostgreSQL.")
+        print(f"   Target (no password): {target}")
+        print("\n   Things to try:")
+        print("   1. Railway → Postgres → Connect → copy the **Public** DATABASE_URL")
+        print("      (must NOT contain *.railway.internal — that only works inside Railway).")
+        print("   2. Paste it into .env as DATABASE_URL=...")
+        print("   3. Try another network (phone hotspot) if school/work Wi-Fi blocks DB ports.")
+        print("   4. In Railway Postgres → Settings → Networking, confirm TCP Proxy is on.")
+        print("   5. If you only need curated aliases: run scripts/railway_manual_aliases.sql")
+        print("      in the Railway Postgres **Query** tab (no script from your laptop needed).")
+        print(f"\n   Original error: {e}\n")
+        raise SystemExit(1) from e
 
 
 # ─── Table creation ───────────────────────────────────────────────────────────
@@ -337,6 +387,8 @@ def main():
         print(f"   ✓ Found {path.name}")
 
     print()
+
+    probe_database_connection()
 
     # Read all CSVs into memory (they're small enough)
     print("📖 Reading CSV files...")

@@ -454,6 +454,51 @@ def build_employer_aliases(merged: dict) -> list[dict]:
     return rows
 
 
+def merge_manual_curated_aliases(alias_rows: list[dict]) -> list[dict]:
+    """
+    Merge rows from curated/manual_employer_aliases.csv into DOL-derived aliases.
+
+    Curated rows win on alias_name collision (same normalized alias → drop the
+    automatic TRADE_NAME_DBA row so brand→legal mappings stay stable).
+
+    primary_employer_name and alias_name in the CSV should match canonical
+    employers.employer_name strings after normalize_employer().
+    """
+    path = Path(__file__).resolve().parent / "curated" / "manual_employer_aliases.csv"
+    if not path.exists():
+        return alias_rows
+
+    curated_by_alias: dict[str, dict] = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for raw in reader:
+            pri = normalize_employer(raw.get("primary_employer_name"))
+            als = normalize_employer(raw.get("alias_name"))
+            if not pri or not als:
+                continue
+            curated_by_alias[als] = {
+                "primary_employer_name": pri,
+                "alias_name": als,
+                "alias_type": (raw.get("alias_type") or "MANUAL_CURATED").strip(),
+                "usage_count": int(raw.get("usage_count") or 0),
+            }
+
+    if not curated_by_alias:
+        return alias_rows
+
+    auto_kept = [
+        r
+        for r in alias_rows
+        if normalize_employer(r.get("alias_name")) not in curated_by_alias
+    ]
+    merged = list(curated_by_alias.values()) + auto_kept
+    merged.sort(key=lambda r: (-r["usage_count"], r["alias_name"]))
+    print(
+        f"   ✓ Merged {len(curated_by_alias):,} manual curated alias(es) from {path.name}"
+    )
+    return merged
+
+
 # ─── CSV writers ─────────────────────────────────────────────────────────────
 
 def write_csv(file_path: Path, rows: list[dict], fieldnames: list[str]) -> None:
@@ -529,6 +574,7 @@ def main():
 
     print("🔄 Building employer_aliases.csv...")
     alias_rows = build_employer_aliases(merged)
+    alias_rows = merge_manual_curated_aliases(alias_rows)
 
     # ── Step 3: Write CSV files ───────────────────────────────────────────────
 

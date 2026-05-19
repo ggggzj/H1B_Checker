@@ -6,6 +6,7 @@ FastAPI H1B Checker API
 
 import json
 import logging
+import math
 import os
 from functools import lru_cache
 from typing import List, Optional, Tuple
@@ -37,7 +38,7 @@ app.add_middleware(
     allow_origin_regex=r"chrome-extension://.*",
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -92,6 +93,44 @@ class SearchResponse(BaseModel):
     results: List[SearchResult]
     total: int
 
+
+class ExtensionSelectors(BaseModel):
+    """DOM selectors served to the Chrome extension."""
+    company_name: List[str]
+    job_card: List[str]
+
+
+class ExtensionConfigResponse(BaseModel):
+    """Remote config for the LinkedIn content script."""
+    version: str
+    selectors: ExtensionSelectors
+
+
+class SelectorMissReport(BaseModel):
+    """Extension telemetry when company name extraction fails."""
+    html: str = ""
+    url: Optional[str] = None
+    selectors_tried: Optional[List[str]] = None
+
+
+# Remote extension config (also embedded in content.js as fallbacks).
+# Primary company detection uses /company/{slug} URLs — CSS lists are backup only.
+EXTENSION_CONFIG_VERSION = "1.0.5"
+EXTENSION_COMPANY_SELECTORS: List[str] = [
+    ".artdeco-entity-lockup__subtitle div[dir='ltr']",
+    ".artdeco-entity-lockup__subtitle",
+    ".job-card-container__company-name",
+    ".base-search-card__subtitle",
+    ".base-card__subtitle",
+    ".base-main-card__subtitle",
+]
+EXTENSION_JOB_CARD_SELECTORS: List[str] = [
+    "[data-job-id]",
+    "li.jobs-search-results__list-item",
+    ".job-card-list__entity-lockup",
+    ".jobs-search-results-list__list-item",
+]
+
 # ============ Semantic search (Layer 4 fallback) ====================
 
 
@@ -128,10 +167,52 @@ def get_embedding_cached(text_key: str) -> Optional[list[float]]:
         return None
 
 
+# Layer 4: fetch more neighbors than we return, then re-rank when scores bunch up.
+_SEMANTIC_FETCH_LIMIT = 10
+# When top-1 and top-2 cosine similarities are within this gap, break ties using
+# certified LCA volume (similarity * log1p(h1b_count)).
+_SIM_TIGHT_SCORE_GAP = 0.04
+# Reject semantic hits that are "almost tied" with the runner-up (too noisy).
+_AMBIGUITY_REJECT_MARGIN = 0.04
+
+
+def _rerank_semantic_candidates(
+    rows: list,
+    similarity_threshold: float,
+) -> list:
+    """
+    If the top vector hits are very close in score, prefer the employer with more
+    certified filings (McKinsey-style: small shell vs main partnership).
+
+    Never promotes a row whose similarity would fall below ``similarity_threshold``;
+    in that case the original vector order is kept.
+    """
+    if len(rows) < 2:
+        return rows
+    s0 = float(rows[0]["similarity"])
+    s1 = float(rows[1]["similarity"])
+    if s0 - s1 >= _SIM_TIGHT_SCORE_GAP:
+        return rows
+    floor = max(similarity_threshold - 0.05, min(s0, s1) - 0.02)
+    pool = [r for r in rows[:6] if float(r["similarity"]) >= floor]
+    if len(pool) < 2:
+        return rows
+    best = max(
+        pool,
+        key=lambda r: float(r["similarity"])
+        * math.log1p(max(int(r["total_h1b_certified"] or 0), 0)),
+    )
+    if float(best["similarity"]) < similarity_threshold:
+        return rows
+    if best["id"] == rows[0]["id"]:
+        return rows
+    return [best] + [r for r in rows if r["id"] != best["id"]]
+
+
 def semantic_search(
     query: str,
     db: Session,
-    similarity_threshold: float = 0.65,
+    similarity_threshold: float = 0.75,
     top_k: int = 3,
 ) -> Tuple[Optional[Employer], float, bool]:
     """
@@ -143,9 +224,9 @@ def semantic_search(
     for monitoring and debugging. Enable with e.g. LOG_LEVEL=INFO on Railway.
     """
     logger.info(
-        "semantic_search start query=%r top_k=%s similarity_threshold=%s",
+        "semantic_search start query=%r fetch_limit=%s similarity_threshold=%s",
         query,
-        top_k,
+        _SEMANTIC_FETCH_LIMIT,
         similarity_threshold,
     )
     try:
@@ -171,7 +252,11 @@ def semantic_search(
             LIMIT :k
             """
         )
-        results = db.execute(sql, {"emb": vec_lit, "k": top_k}).mappings().all()
+        results = list(
+            db.execute(
+                sql, {"emb": vec_lit, "k": _SEMANTIC_FETCH_LIMIT}
+            ).mappings().all()
+        )
 
         if not results:
             logger.info(
@@ -179,6 +264,8 @@ def semantic_search(
                 query,
             )
             return None, 0.0, False
+
+        results = _rerank_semantic_candidates(results, similarity_threshold)
 
         top1_score = float(results[0]["similarity"])
         is_ambiguous = False
@@ -195,7 +282,7 @@ def semantic_search(
                 "employer_name": r["employer_name"],
                 "similarity": round(float(r["similarity"]), 4),
             }
-            for r in results
+            for r in results[: max(top_k, 5)]
         ]
         logger.info(
             "semantic_search candidates query=%r top=%s ambiguous=%s margin=%s",
@@ -215,6 +302,16 @@ def semantic_search(
                 is_ambiguous,
             )
             return None, top1_score, is_ambiguous
+
+        if is_ambiguous and margin is not None and margin < _AMBIGUITY_REJECT_MARGIN:
+            logger.info(
+                "semantic_search miss query=%r reason=ambiguous_tight_margin "
+                "top1_similarity=%.4f margin=%.4f",
+                query,
+                top1_score,
+                margin,
+            )
+            return None, top1_score, True
 
         best_match = db.query(Employer).filter(Employer.id == results[0]["id"]).first()
         logger.info(
@@ -315,7 +412,9 @@ async def check_employer(
 
     # 4) Semantic fallback (requires OPENAI_API_KEY + pgvector embeddings on rows)
     semantic_match, confidence, is_ambiguous = semantic_search(
-        company_normalized, db
+        company_normalized,
+        db,
+        similarity_threshold=0.75,
     )
     if semantic_match:
         match_confidence = confidence * 0.9 if is_ambiguous else confidence
@@ -368,6 +467,41 @@ async def search_employers(
 
     return SearchResponse(results=results, total=len(results))
 
+# ============ Extension config & telemetry ============
+
+@app.get("/config", response_model=ExtensionConfigResponse)
+async def get_extension_config():
+    """
+    Remote DOM selectors for the Chrome extension.
+
+    When LinkedIn changes markup, update EXTENSION_COMPANY_SELECTORS here so
+    installed clients can pick up new selectors without a store release.
+    """
+    return ExtensionConfigResponse(
+        version=EXTENSION_CONFIG_VERSION,
+        selectors=ExtensionSelectors(
+            company_name=EXTENSION_COMPANY_SELECTORS,
+            job_card=EXTENSION_JOB_CARD_SELECTORS,
+        ),
+    )
+
+
+@app.post("/report-selector-miss")
+async def report_selector_miss(report: SelectorMissReport):
+    """
+    Log when the extension cannot extract a company name from a job card.
+    Helps detect LinkedIn DOM changes early.
+    """
+    snippet = (report.html or "")[:500]
+    logger.warning(
+        "[SELECTOR MISS] url=%s selectors=%s snippet=%s",
+        report.url,
+        report.selectors_tried,
+        snippet,
+    )
+    return {"ok": True}
+
+
 # ============ Health ============
 
 @app.get("/health")
@@ -384,6 +518,7 @@ async def root():
         "endpoints": {
             "check": "/check?company=Google",
             "search": "/search?q=amazon&limit=5",
+            "config": "/config",
             "health": "/health",
             "docs": "/docs"
         }
