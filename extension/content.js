@@ -16,33 +16,175 @@ const CONFIG_STORAGE_KEY = 'h1bExtensionConfig';
 // Matches linkedin.com/company/acme-corp/... — product URL, not hashed CSS classes.
 const LINKEDIN_COMPANY_PATH = /linkedin\.com\/company\/([^/?#]+)/i;
 
+// Left list layout (2025–2026) — tried after /company/ URLs, before detail-panel fallbacks.
+const LEFT_LIST_COMPANY_SELECTORS = [
+  '.job-card-container__company-name',
+  '[class*="job-card-container__company-name"]',
+  '.job-card-container__primary-description',
+  '[class*="job-card-list__company-name"]',
+  '.job-card-list__entity-lockup .artdeco-entity-lockup__subtitle',
+  '[class*="entity-lockup__subtitle"]',
+];
+
 const DEFAULT_COMPANY_SELECTORS = [
+  ...LEFT_LIST_COMPANY_SELECTORS,
   '.artdeco-entity-lockup__subtitle div[dir="ltr"]',
   '.artdeco-entity-lockup__subtitle',
-  '.job-card-container__company-name',
   '.base-search-card__subtitle',
   '.base-card__subtitle',
   '.base-main-card__subtitle',
+  '.jobs-unified-top-card__company-name',
+  '.job-details-jobs-unified-top-card__company-name',
+];
+
+/** Temporary debug — set false before release. */
+const DEBUG_PROCESS_JOBS = false;
+
+/** Process left list cards first; detail panel can be re-enabled later. */
+const FOCUS_LIST_BADGES_ONLY = true;
+
+const API_CHECK_CONCURRENCY = 4;
+
+// Left list often uses data-occludable-job-id; detail panel uses data-job-id.
+const LEFT_LIST_CARD_SELECTORS = [
+  '[data-occludable-job-id]',
+  '.jobs-search-results-list__list-item',
+  'li.jobs-search-results__list-item',
+  'li.scaffold-layout__list-item',
+  '.job-card-list__entity-lockup',
 ];
 
 const DEFAULT_JOB_CARD_SELECTORS = [
   '[data-job-id]',
-  'li.jobs-search-results__list-item',
-  '.job-card-list__entity-lockup',
-  '.jobs-search-results-list__list-item',
+  ...LEFT_LIST_CARD_SELECTORS,
+];
+
+const DETAIL_PANEL_ROOT_SELECTORS = [
+  '.jobs-unified-top-card',
+  '.job-details-jobs-unified-top-card',
+  '.jobs-search__job-details',
 ];
 
 let companySelectors = [...DEFAULT_COMPANY_SELECTORS];
 let jobCardSelectors = [...DEFAULT_JOB_CARD_SELECTORS];
 
 const cache = new Map();
+let apiHealthy = null;
+let apiHealthCheckedAt = 0;
+let apiDownUntil = 0;
+
+let filteringEnabled = true;
+let sessionJobsScanned = 0;
+let sessionSponsorsFound = 0;
+
 const reportedMissCards = new WeakSet();
 const cardCompanyAnchors = new WeakMap();
+
+/** Prefer session storage; fall back to local if unavailable. */
+function getSessionStorage() {
+  try {
+    if (!chrome.runtime?.id) return null;
+    return chrome.storage?.session ?? chrome.storage?.local;
+  } catch {
+    return null;
+  }
+}
+
+function safeStorageGet(keys, callback) {
+  try {
+    const storage = getSessionStorage();
+    if (!storage) {
+      callback({});
+      return;
+    }
+    storage.get(keys, (data) => {
+      if (chrome.runtime.lastError) {
+        callback({});
+        return;
+      }
+      callback(data || {});
+    });
+  } catch {
+    callback({});
+  }
+}
+
+function safeStorageSet(values) {
+  try {
+    getSessionStorage()?.set(values);
+  } catch {
+    /* LinkedIn iframes may block storage */
+  }
+}
+
+function applyFilteringEnabled(enabled) {
+  filteringEnabled = enabled;
+  if (!filteringEnabled) {
+    document.querySelectorAll('.h1b-badge').forEach((el) => el.remove());
+    document.querySelectorAll('[data-h1b-done], [data-h1b-name-attempts]').forEach((card) => {
+      delete card.dataset.h1bDone;
+      delete card.dataset.h1bNameAttempts;
+    });
+    return;
+  }
+  processJobs();
+}
+
+safeStorageGet({ filteringEnabled: true, jobsScanned: 0, sponsorsFound: 0 }, (data) => {
+  filteringEnabled = data?.filteringEnabled !== false;
+  sessionJobsScanned = data?.jobsScanned || 0;
+  sessionSponsorsFound = data?.sponsorsFound || 0;
+  scheduleInitialPasses();
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.action === 'setFilteringEnabled') {
+    applyFilteringEnabled(message.enabled);
+    getSessionStorage()?.set({ filteringEnabled: message.enabled });
+  }
+});
+
+getSessionStorage()?.onChanged?.addListener((changes, areaName) => {
+  if (areaName !== 'session' && areaName !== 'local') return;
+  if (changes.filteringEnabled) {
+    applyFilteringEnabled(changes.filteringEnabled.newValue !== false);
+  }
+});
 
 const MAX_NAME_ATTEMPTS = 8;
 const FETCH_TIMEOUT_MS = 8000;
 const CONFIG_FETCH_TIMEOUT_MS = 5000;
 const CONFIG_REFRESH_MS = 30 * 60 * 1000;
+
+/** API calls via background service worker (no LinkedIn page CORS). */
+function extensionApiFetch(path, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (!chrome.runtime?.id) {
+      reject(new Error('Extension context unavailable'));
+      return;
+    }
+    chrome.runtime.sendMessage(
+      {
+        action: 'apiFetch',
+        path,
+        method: options.method || 'GET',
+        body: options.body,
+        timeoutMs: options.timeoutMs,
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        if (!response?.ok) {
+          reject(new Error(response?.error || `HTTP ${response?.status ?? 'error'}`));
+          return;
+        }
+        resolve(response.data);
+      }
+    );
+  });
+}
 
 
 // ─────────────────────────────────────────────
@@ -62,7 +204,8 @@ function applyExtensionConfig(config) {
   if (!config?.selectors) return false;
   let updated = false;
   if (applySelectorList(config.selectors.company_name, DEFAULT_COMPANY_SELECTORS, (v) => {
-    companySelectors = v;
+    companySelectors = [...new Set([...LEFT_LIST_COMPANY_SELECTORS, ...v])];
+    updated = true;
   })) {
     updated = true;
   }
@@ -92,17 +235,8 @@ function writeCachedConfig(config) {
 }
 
 async function loadConfig() {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), CONFIG_FETCH_TIMEOUT_MS);
-
   try {
-    const response = await fetch(`${API_URL}/config`, { signal: controller.signal });
-    if (!response.ok) {
-      console.warn('[H1B] Config fetch HTTP error:', response.status);
-      return false;
-    }
-
-    const config = await response.json();
+    const config = await extensionApiFetch('/config', { timeoutMs: CONFIG_FETCH_TIMEOUT_MS });
     if (applyExtensionConfig(config)) {
       writeCachedConfig(config);
       console.log('[H1B] Config loaded, version:', config.version);
@@ -113,8 +247,6 @@ async function loadConfig() {
   } catch (error) {
     console.warn('[H1B] Config fetch failed, using bundled defaults:', error);
     return false;
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -143,7 +275,79 @@ function _trimCompanyText(s) {
   const t = String(s).replace(/\s+/g, ' ').trim();
   if (!t || t.length > 200) return null;
   if (/^\d+\s+school alumni/i.test(t)) return null;
+  if (/^promoted$/i.test(t)) return null;
+  if (/^in\s+easy apply$/i.test(t)) return null;
+  if (/\$\d|\/yr|401\s*\(\s*k\s*\)/i.test(t)) return null;
+  if (/^\d+\s+(day|week|month)s?\s+ago$/i.test(t)) return null;
   return t;
+}
+
+/** True when the whole string looks like a location line, not "Company · City". */
+function looksLikeLocation(text) {
+  if (!text) return true;
+  if (/\(remote\)|\(on-site\)|\(hybrid\)/i.test(text)) return true;
+  // "San Francisco, CA" or "New York, NY" — comma + state/country code
+  if (/,\s*[A-Z]{2}(\s|$|\))/i.test(text) && !text.includes('·')) return true;
+  return false;
+}
+
+/** Extract company from "Acme Corp · San Francisco, CA" or plain "Acme Corp". */
+function parseCompanyFromLine(text) {
+  const raw = _trimCompanyText(text);
+  if (!raw) return null;
+
+  if (raw.includes('·')) {
+    for (const part of raw.split('·')) {
+      const name = _trimCompanyText(part);
+      if (name && !looksLikeLocation(name) && isValidCompanyName(name)) return name;
+    }
+    return null;
+  }
+
+  if (looksLikeLocation(raw)) return null;
+  return isValidCompanyName(raw) ? raw : null;
+}
+
+function isValidCompanyName(name) {
+  if (!name || name.length < 2 || name.length > 70) return false;
+  if (/followers|premium|insights|show\s+/i.test(name)) return false;
+  if (/\d{1,3}(,\d{3})+/.test(name)) return false;
+  if (/^[\d,.\s]+$/.test(name)) return false;
+  return true;
+}
+
+function isDetailPanelCard(card) {
+  return DETAIL_PANEL_ROOT_SELECTORS.some((sel) => card.closest(sel));
+}
+
+function isJobLinkInDetailPanel(link) {
+  return !!link.closest(
+    '.jobs-search__job-details, .jobs-details, .jobs-unified-top-card, ' +
+      '.job-details-jobs-unified-top-card, [class*="job-details"]'
+  );
+}
+
+/** Left split-pane (job list column). */
+function isInLeftJobsPane(el) {
+  const rect = el.getBoundingClientRect?.();
+  if (!rect || (rect.width === 0 && rect.height === 0)) return false;
+  const centerX = rect.left + rect.width / 2;
+  return centerX < window.innerWidth * 0.52;
+}
+
+/** List row: explicitly discovered job row (not the whole left sidebar). */
+function isJobsListCard(card) {
+  if (isDetailPanelCard(card)) return false;
+  if (card.querySelector('.jobs-unified-top-card, .job-details-jobs-unified-top-card')) {
+    return false;
+  }
+  return card.dataset.h1bListCard === '1';
+}
+
+function containsDetailPanel(card) {
+  return !!card.querySelector(
+    '.jobs-unified-top-card, .job-details-jobs-unified-top-card'
+  );
 }
 
 function parseLinkedInCompanySlug(url) {
@@ -189,14 +393,225 @@ function getCompanyLinkCandidates(card) {
   return candidates;
 }
 
+function getCompanyFromEntityLockup(card) {
+  const subtitles = card.querySelectorAll(
+    '.artdeco-entity-lockup__subtitle span[dir="ltr"], ' +
+      '.artdeco-entity-lockup__subtitle, ' +
+      '[class*="entity-lockup__subtitle"]'
+  );
+
+  for (const subtitle of subtitles) {
+    if (
+      !isDetailPanelCard(card) &&
+      subtitle.closest('.jobs-unified-top-card, .job-details-jobs-unified-top-card')
+    ) {
+      continue;
+    }
+
+    const company = parseCompanyFromLine(subtitle.textContent);
+    if (company && isValidCompanyName(company)) {
+      cardCompanyAnchors.set(card, subtitle);
+      return company;
+    }
+  }
+
+  return null;
+}
+
+const LIST_LOCATION_PATTERN =
+  /\b(remote|hybrid|on[\s-]?site)\b|,\s*[A-Z]{2}\b|\([A-Za-z\s]+,\s*[A-Z]{2}\)/i;
+const LIST_META_PATTERN = /^[•·\-–—]+$|^(be an early|easy apply|actively|get job alerts)|promoted jobs are ranked|how promoted|\d+\+?\s*results?\b|\bbe an early applicant\b|\d+\s*(benefit|connection|applicant|result|follower)s?\b|\b(ago|viewed|about|premium|easy apply|actively|posted|reposted)\b|^[\d,]+$|%|^(your feedback|show)/i;
+const LIST_JOB_TITLE_PATTERN = /\b(engineer|developer|architect|manager|analyst|scientist|designer|consultant|specialist|director|lead|senior|junior|staff|principal|intern|associate|founder|officer|executive|full[\s-]?stack|front[\s-]?end|back[\s-]?end|machine[\s-]?learning|software|generative|agentic|emerging)\b/i;
+
+function isJunkListLine(text) {
+  if (!text || text.length < 2) return true;
+  if (LIST_META_PATTERN.test(text)) return true;
+  return false;
+}
+
+/** Visible text lines for one list row (<p> preferred; skip nested span fragments). */
+function collectListCardLines(rowContainer) {
+  const lines = [];
+  const seen = new Set();
+
+  rowContainer.querySelectorAll('p, span[dir="ltr"]').forEach((el) => {
+    if (el.closest('.h1b-badge')) return;
+    if (el.tagName === 'SPAN' && el.closest('p')) return;
+
+    const text = _trimCompanyText(el.textContent);
+    if (!text || seen.has(text) || isJunkListLine(text)) return;
+
+    seen.add(text);
+    lines.push({ el, text, len: text.length });
+  });
+
+  return lines;
+}
+
+/** Title is first longest line in DOM order; then drop job-title / location / metadata lines. */
+function pickListCompanyLine(lines) {
+  if (!lines.length) return null;
+
+  const maxLen = Math.max(...lines.map((l) => l.len));
+  const titleIdx = lines.findIndex((l) => l.len === maxLen);
+  const withoutTitle = titleIdx >= 0 ? lines.filter((_, i) => i !== titleIdx) : lines;
+
+  const withoutJobTitles = withoutTitle.filter((l) => !LIST_JOB_TITLE_PATTERN.test(l.text));
+  const withoutLocation = withoutJobTitles.filter((l) => !LIST_LOCATION_PATTERN.test(l.text));
+  const candidates = withoutLocation.filter(
+    (l) => !LIST_META_PATTERN.test(l.text) && l.len >= 2 && l.len <= 60
+  );
+
+  if (!candidates.length) return { match: null, lines, candidates };
+
+  return { match: candidates[0], lines, candidates };
+}
+
+/**
+ * Left list row structure (DOM order):
+ *   line 1 (longest) = job title
+ *   line 2 (short)   = company name
+ *   line 3           = location / metadata
+ */
+function getCompanyFromListCard(rowContainer, options = {}) {
+  const lines = collectListCardLines(rowContainer);
+  if (lines.length === 0) return null;
+
+  const { match, candidates } = pickListCompanyLine(lines);
+
+  if (DEBUG_PROCESS_JOBS && !options.quiet && isInLeftJobsPane(rowContainer)) {
+    console.log(
+      `[H1B] LIST lines found: ${lines.length}, after filter: ${candidates.length}, ` +
+        `picked: ${match?.text ?? '(none)'}`
+    );
+  }
+
+  if (!match) return null;
+
+  const name = parseCompanyFromLine(match.text) || match.text;
+  if (!name || !isValidCompanyName(name)) return null;
+
+  return { name, el: match.el };
+}
+
+function countListCardParagraphs(el) {
+  return el.querySelectorAll('p').length;
+}
+
+function isTightListJobRow(el) {
+  const pCount = countListCardParagraphs(el);
+  return pCount >= 2 && pCount <= 6;
+}
+
+function getListCompanyFromRow(rowContainer, quiet = true) {
+  return getCompanyFromListCard(rowContainer, { quiet });
+}
+
+function resolveCompanyFromLink(link, card) {
+  const text = parseCompanyFromLine(link.textContent);
+  if (text && isValidCompanyName(text)) {
+    cardCompanyAnchors.set(card, link);
+    return text;
+  }
+  const fromSlug = slugToLookupName(parseLinkedInCompanySlug(getLinkHref(link)));
+  if (fromSlug && isValidCompanyName(fromSlug)) {
+    cardCompanyAnchors.set(card, link);
+    return fromSlug;
+  }
+  return null;
+}
+
+/** Right detail panel — stable selectors only (no paragraph scanning). */
+function getCompanyFromDetailPanel(card) {
+  const scope =
+    document.querySelector('.jobs-unified-top-card, .job-details-jobs-unified-top-card') ||
+    card.querySelector('.jobs-unified-top-card, .job-details-jobs-unified-top-card') ||
+    card;
+
+  const companyNameEl = scope.querySelector(
+    '.jobs-unified-top-card__company-name, .job-details-jobs-unified-top-card__company-name'
+  );
+
+  if (companyNameEl) {
+    const linkInBlock = companyNameEl.querySelector('a[href*="/company/"]');
+    if (linkInBlock) {
+      const fromLink = resolveCompanyFromLink(linkInBlock, card);
+      if (fromLink) return fromLink;
+    }
+
+    const fromBlock = parseCompanyFromLine(companyNameEl.textContent);
+    if (fromBlock && isValidCompanyName(fromBlock)) {
+      cardCompanyAnchors.set(card, companyNameEl);
+      return fromBlock;
+    }
+  }
+
+  for (const link of scope.querySelectorAll('a[href*="/company/"]')) {
+    const fromLink = resolveCompanyFromLink(link, card);
+    if (fromLink) return fromLink;
+  }
+
+  return null;
+}
+
 /**
  * Resolve company name for API lookup. Prefers visible link text, then URL slug.
  */
 function getCompanyLookup(card) {
+  const inList = isJobsListCard(card);
+
+  if (!inList && (isDetailPanelCard(card) || card.querySelector('.jobs-unified-top-card'))) {
+    const fromDetail = getCompanyFromDetailPanel(card);
+    if (fromDetail) return fromDetail;
+  }
+
+  // Left list: position-based line structure inside the row.
+  if (inList) {
+    let picked = getListCompanyFromRow(card);
+    if (!picked) {
+      let el = card.parentElement;
+      for (let depth = 0; depth < 4 && el; depth++) {
+        if (!isInLeftJobsPane(el) || isDetailPanelCard(el)) break;
+        if (isTightListJobRow(el)) {
+          picked = getListCompanyFromRow(el);
+          if (picked) break;
+        }
+        el = el.parentElement;
+      }
+    }
+    if (picked) {
+      cardCompanyAnchors.set(card, picked.el);
+      return picked.name;
+    }
+
+    for (const selector of LEFT_LIST_COMPANY_SELECTORS) {
+      const el = card.querySelector(selector);
+      const name = parseCompanyFromLine(el?.textContent);
+      if (name) {
+        cardCompanyAnchors.set(card, el);
+        return name;
+      }
+    }
+
+    const fromLockup = getCompanyFromEntityLockup(card);
+    if (fromLockup) return fromLockup;
+
+    const primary = card.querySelector(
+      '.job-card-container__primary-description, [class*="primary-description"]'
+    );
+    if (primary) {
+      const name = parseCompanyFromLine(primary.textContent.split('\n')[0]);
+      if (name) {
+        cardCompanyAnchors.set(card, primary);
+        return name;
+      }
+    }
+  }
+
   const candidates = getCompanyLinkCandidates(card);
 
   for (const c of candidates) {
-    if (c.text) {
+    if (c.text && isValidCompanyName(c.text)) {
       cardCompanyAnchors.set(card, c.node);
       return c.text;
     }
@@ -204,16 +619,21 @@ function getCompanyLookup(card) {
 
   for (const c of candidates) {
     const fromSlug = slugToLookupName(c.slug);
-    if (fromSlug) {
+    if (fromSlug && isValidCompanyName(fromSlug)) {
       cardCompanyAnchors.set(card, c.node);
       return fromSlug;
     }
   }
 
+  if (!inList) {
+    const fromLockup = getCompanyFromEntityLockup(card);
+    if (fromLockup && isValidCompanyName(fromLockup)) return fromLockup;
+  }
+
   for (const selector of companySelectors) {
     const el = card.querySelector(selector);
-    const name = _trimCompanyText(el?.textContent);
-    if (name) {
+    const name = parseCompanyFromLine(el?.textContent);
+    if (name && isValidCompanyName(name)) {
       cardCompanyAnchors.set(card, el);
       return name;
     }
@@ -227,11 +647,61 @@ function getCompanyLookup(card) {
 // Job card discovery
 // ─────────────────────────────────────────────
 
-function outermostDataJobIdCard(el) {
+/** Job card leaf: has data-job-id but no nested data-job-id (list + detail rows). */
+function leafDataJobIdCard(el) {
   const card = el.matches?.('[data-job-id]') ? el : el.closest?.('[data-job-id]');
   if (!card) return null;
-  if (card.parentElement?.closest('[data-job-id]')) return null;
+  if (card.querySelector('[data-job-id]')) return null;
   return card;
+}
+
+function resetRemountedJobCards() {
+  document.querySelectorAll('[data-h1b-done="1"]').forEach((card) => {
+    if (!card.querySelector('.h1b-badge')) {
+      delete card.dataset.h1bDone;
+      delete card.dataset.h1bNameAttempts;
+    }
+  });
+}
+
+function normalizeListCard(el) {
+  if (el.matches?.('.job-card-list__entity-lockup')) {
+    return (
+      el.closest(
+        '[data-occludable-job-id], [data-job-id], li.jobs-search-results__list-item, .jobs-search-results-list__list-item, li.scaffold-layout__list-item'
+      ) || el
+    );
+  }
+  return el;
+}
+
+function findAllLeafDataJobIdCards() {
+  return [...document.querySelectorAll('[data-job-id]')].filter(
+    (el) => !el.querySelector('[data-job-id]')
+  );
+}
+
+function findLeftListJobCards() {
+  const seen = new Set();
+  const cards = [];
+
+  for (const selector of LEFT_LIST_CARD_SELECTORS) {
+    let nodes;
+    try {
+      nodes = document.querySelectorAll(selector);
+    } catch {
+      continue;
+    }
+
+    for (const el of nodes) {
+      let card = normalizeListCard(el);
+      if (!card || isDetailPanelCard(card) || seen.has(card)) continue;
+      seen.add(card);
+      cards.push(card);
+    }
+  }
+
+  return cards;
 }
 
 function findJobCardsFromSelectors() {
@@ -249,8 +719,11 @@ function findJobCardsFromSelectors() {
     for (const el of nodes) {
       let card = el;
       if (selector === '[data-job-id]') {
-        card = outermostDataJobIdCard(el);
+        card = leafDataJobIdCard(el);
         if (!card) continue;
+      } else if (LEFT_LIST_CARD_SELECTORS.includes(selector)) {
+        card = normalizeListCard(el);
+        if (isDetailPanelCard(card)) continue;
       }
 
       if (seen.has(card)) continue;
@@ -269,7 +742,7 @@ function findJobCardContainerFromLink(link) {
     if (!el.parentElement) break;
     el = el.parentElement;
 
-    const byId = outermostDataJobIdCard(el);
+    const byId = leafDataJobIdCard(el);
     if (byId) return byId;
 
     const companyLinks = el.querySelectorAll("a[href*='/company/']");
@@ -294,19 +767,87 @@ function findJobCardContainerFromLink(link) {
   );
 }
 
-function findJobCardsFromCompanyLinks() {
+function findListCardContainerForJobLink(jobLink) {
+  let el = jobLink;
+  let best = null;
+  let bestPCount = Infinity;
+
+  for (let depth = 0; depth < 18; depth++) {
+    if (!el.parentElement) break;
+    el = el.parentElement;
+    if (!isInLeftJobsPane(el) || isDetailPanelCard(el)) break;
+
+    const rect = el.getBoundingClientRect?.();
+    const h = rect?.height ?? 0;
+    if (h < 32 || h > 480) continue;
+
+    const pCount = countListCardParagraphs(el);
+    if (pCount >= 2 && pCount <= 6 && getListCompanyFromRow(el) && pCount < bestPCount) {
+      best = el;
+      bestPCount = pCount;
+    }
+  }
+
+  return best || jobLink.closest('li, [role="listitem"]') || jobLink.parentElement?.parentElement;
+}
+
+function getJobsListRoot() {
+  return (
+    document.querySelector('.jobs-search-results-list') ||
+    document.querySelector('[class*="jobs-search-results-list"]') ||
+    document.querySelector('.scaffold-layout__list') ||
+    null
+  );
+}
+
+/** Smallest row wrapper around a company <p> (one title + one company + location). */
+function findTightJobRowForCompanyP(pEl) {
+  let best = null;
+  let el = pEl;
+
+  for (let depth = 0; depth < 14; depth++) {
+    if (!el.parentElement) break;
+    el = el.parentElement;
+    if (!isInLeftJobsPane(el) || isDetailPanelCard(el)) break;
+
+    const rect = el.getBoundingClientRect?.();
+    const h = rect?.height ?? 0;
+    if (h < 36 || h > 420) continue;
+
+    if (isTightListJobRow(el)) {
+      best = el;
+      const parent = el.parentElement;
+      if (parent && isInLeftJobsPane(parent) && countListCardParagraphs(parent) > 8) {
+        return el;
+      }
+    }
+  }
+
+  return best;
+}
+
+function findJobCardsFromListCompanyLines() {
   const seen = new Set();
   const cards = [];
-  const links = document.querySelectorAll(
-    "a[href*='/company/'], [data-original-url*='/company/']"
-  );
+  const root = getJobsListRoot();
+  const scope = root || document.body;
 
-  for (const link of links) {
-    if (!parseLinkedInCompanySlug(getLinkHref(link))) continue;
-
-    const card = findJobCardContainerFromLink(link);
+  for (const p of scope.querySelectorAll('p')) {
+    if (root && !root.contains(p)) continue;
+    if (!isInLeftJobsPane(p)) continue;
+    if (p.closest('.jobs-unified-top-card, .job-details-jobs-unified-top-card, .h1b-badge')) {
+      continue;
+    }
+    const card = findTightJobRowForCompanyP(p);
     if (!card || seen.has(card)) continue;
 
+    if (containsDetailPanel(card)) continue;
+
+    const picked = getListCompanyFromRow(card);
+    if (!picked) continue;
+
+    cardCompanyAnchors.set(card, picked.el);
+    card.dataset.h1bListCard = '1';
     seen.add(card);
     cards.push(card);
   }
@@ -314,10 +855,64 @@ function findJobCardsFromCompanyLinks() {
   return cards;
 }
 
+/** Primary list discovery when data-job-id / data-occludable-job-id are absent. */
+function findJobCardsFromJobViewLinks() {
+  const seen = new Set();
+  const cards = [];
+
+  for (const link of document.querySelectorAll('a[href*="/jobs/view/"]')) {
+    if (isJobLinkInDetailPanel(link)) continue;
+
+    const card = findListCardContainerForJobLink(link);
+    if (!card || isDetailPanelCard(card) || containsDetailPanel(card) || seen.has(card)) {
+      continue;
+    }
+    const picked = getListCompanyFromRow(card);
+    if (!picked) continue;
+
+    cardCompanyAnchors.set(card, picked.el);
+    card.dataset.h1bListCard = '1';
+    seen.add(card);
+    cards.push(card);
+  }
+
+  return cards;
+}
+
+function findDetailPanelCards() {
+  const top = document.querySelector(
+    '.jobs-unified-top-card, .job-details-jobs-unified-top-card'
+  );
+  return top ? [top] : [];
+}
+
+function dedupeToInnermostCards(cards) {
+  return cards.filter((card) => {
+    if (isDetailPanelCard(card)) return true;
+    return !cards.some((other) => other !== card && other.contains(card));
+  });
+}
+
 function findJobCards() {
-  const fromSelectors = findJobCardsFromSelectors();
-  if (fromSelectors.length > 0) return fromSelectors;
-  return findJobCardsFromCompanyLinks();
+  const seen = new Set();
+  const cards = [];
+
+  const merge = (found) => {
+    for (const card of found) {
+      if (!card || seen.has(card)) continue;
+      seen.add(card);
+      cards.push(card);
+    }
+  };
+
+  merge(findJobCardsFromListCompanyLines());
+  merge(findDetailPanelCards());
+  merge(findJobCardsFromJobViewLinks());
+  merge(findLeftListJobCards());
+  merge(findAllLeafDataJobIdCards());
+  merge(findJobCardsFromSelectors());
+
+  return dedupeToInnermostCards(cards);
 }
 
 
@@ -325,15 +920,85 @@ function findJobCards() {
 // processJobs / API / badge
 // ─────────────────────────────────────────────
 
+async function ensureApiHealthy() {
+  const now = Date.now();
+  if (now < apiDownUntil) return false;
+  if (apiHealthy === true && now - apiHealthCheckedAt < 60_000) return true;
+  if (apiHealthy === false && now - apiHealthCheckedAt < 30_000) return false;
+
+  try {
+    await extensionApiFetch('/health', { timeoutMs: 5000 });
+    apiHealthy = true;
+    apiDownUntil = 0;
+  } catch (error) {
+    apiHealthy = false;
+    apiDownUntil = now + 120_000;
+    console.warn(
+      '[H1B] API offline — badges need a live server at /check. ' +
+        'Redeploy Railway (h1bchecker-production).',
+      error?.message || error
+    );
+  }
+  apiHealthCheckedAt = now;
+  return apiHealthy;
+}
+
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+
+  const workers = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return results;
+}
+
 async function processJobs() {
-  const jobCards = findJobCards();
+  if (!filteringEnabled) return;
+
+  resetRemountedJobCards();
+
+  let jobCards = findJobCards();
+  if (FOCUS_LIST_BADGES_ONLY) {
+    const listCards = jobCards.filter(isJobsListCard);
+    if (listCards.length) jobCards = listCards;
+  }
+
+  if (jobCards.length === 0) return;
+
   const pending = [];
+
+  if (DEBUG_PROCESS_JOBS) {
+    const listCount = jobCards.filter(isJobsListCard).length;
+    const viewLinks = document.querySelectorAll('a[href*="/jobs/view/"]').length;
+    console.log(
+      `[H1B] processJobs: ${jobCards.length} card(s) ` +
+        `(${listCount} list), job-view-links=${viewLinks}`
+    );
+  }
 
   for (const card of jobCards) {
     const status = card.dataset.h1bDone;
     if (status === '1' || status === 'abandon' || status === 'pending') continue;
 
     const companyName = getCompanyLookup(card);
+
+    if (DEBUG_PROCESS_JOBS) {
+      const jobId =
+        card.getAttribute('data-job-id') ||
+        card.getAttribute('data-occludable-job-id') ||
+        '(no id)';
+      console.log(
+        `[H1B] ${isJobsListCard(card) ? 'LIST' : 'DETAIL'} card ${String(jobId).slice(0, 14)}… company:`,
+        companyName ?? '(null)'
+      );
+    }
 
     if (!companyName) {
       const n = parseInt(card.dataset.h1bNameAttempts || '0', 10) + 1;
@@ -352,71 +1017,68 @@ async function processJobs() {
 
   if (pending.length === 0) return;
 
-  await Promise.all(
-    pending.map(async ({ card, companyName }) => {
-      const sponsorInfo = await getH1BInfo(companyName);
-      if (!sponsorInfo) {
-        if (card.dataset.h1bDone === 'pending') delete card.dataset.h1bDone;
-        return;
-      }
-      addBadge(card, sponsorInfo);
-      card.dataset.h1bDone = '1';
-    })
-  );
+  if (!(await ensureApiHealthy())) {
+    for (const { card } of pending) {
+      if (card.dataset.h1bDone === 'pending') delete card.dataset.h1bDone;
+    }
+    return;
+  }
+
+  await mapWithConcurrency(pending, API_CHECK_CONCURRENCY, async ({ card, companyName }) => {
+    const sponsorInfo = await getH1BInfo(companyName);
+    if (!sponsorInfo) {
+      if (card.dataset.h1bDone === 'pending') delete card.dataset.h1bDone;
+      return;
+    }
+    addBadge(card, sponsorInfo);
+    card.dataset.h1bDone = '1';
+  });
 }
 
 function reportSelectorMiss(card) {
   if (reportedMissCards.has(card)) return;
   reportedMissCards.add(card);
 
-  fetch(`${API_URL}/report-selector-miss`, {
+  extensionApiFetch('/report-selector-miss', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+    body: {
       html: card.innerHTML.slice(0, 300),
       url: window.location.href,
-      selectors_tried: {
-        company: companySelectors,
-        job_card: jobCardSelectors,
-      },
-    }),
+      selectors_tried: [...companySelectors, ...jobCardSelectors],
+    },
   }).catch(() => {});
 }
 
 function getH1BInfo(companyName) {
   const key = companyName.toLowerCase();
 
+  if (Date.now() < apiDownUntil) {
+    return Promise.resolve(null);
+  }
+
   if (cache.has(key)) {
     return cache.get(key);
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
   const promise = (async () => {
     try {
-      const response = await fetch(
-        `${API_URL}/check?company=${encodeURIComponent(companyName)}`,
-        { signal: controller.signal }
+      const data = await extensionApiFetch(
+        `/check?company=${encodeURIComponent(companyName)}`,
+        { timeoutMs: FETCH_TIMEOUT_MS }
       );
-
-      if (!response.ok) {
-        console.error('H1B API HTTP error:', response.status, await response.text());
-        cache.delete(key);
-        return null;
-      }
-
-      const data = await response.json();
       return {
         sponsors: data.sponsors_h1b,
         count: data.h1b_count,
       };
     } catch (error) {
-      console.error('H1B API error:', error);
+      const msg = String(error?.message || error);
+      if (msg.includes('Application not found') || msg.includes('HTTP 404')) {
+        apiHealthy = false;
+        apiDownUntil = Date.now() + 120_000;
+      }
+      if (DEBUG_PROCESS_JOBS) console.error('H1B API error:', error);
       cache.delete(key);
       return null;
-    } finally {
-      clearTimeout(timeoutId);
     }
   })();
 
@@ -429,18 +1091,71 @@ function addBadge(card, info) {
 
   const badge = document.createElement('div');
   badge.className = `h1b-badge ${info.sponsors ? 'sponsor-yes' : 'sponsor-no'}`;
-  badge.innerHTML = info.sponsors ? '✓ Sponsors H1B' : '✗ No Sponsor';
+  badge.textContent = info.sponsors ? '✓ Sponsors H1B' : '✗ Not Found';
 
-  const anchor =
-    cardCompanyAnchors.get(card) ||
-    card.querySelector("a[href*='/company/']") ||
-    card.querySelector('[class*="company"]');
+  const anchor = cardCompanyAnchors.get(card);
+  const listMode = isJobsListCard(card);
 
-  if (anchor?.parentElement) {
+  const detailCompany = card.querySelector(
+    '.job-details-jobs-unified-top-card__company-name, ' +
+      '.jobs-unified-top-card__company-name, ' +
+      '[class*="top-card__company-name"], ' +
+      'a[href*="/company/"]'
+  );
+
+  if (listMode) {
+    badge.classList.add('h1b-badge--list');
+
+    const listAnchor =
+      (anchor && card.contains(anchor) ? anchor : null) ||
+      (detailCompany && card.contains(detailCompany) ? detailCompany : null);
+
+    if (listAnchor) {
+      listAnchor.insertAdjacentElement('afterend', badge);
+      recordBadgeStats(info);
+      return;
+    }
+
+    const picked = getListCompanyFromRow(card);
+    if (picked?.el && card.contains(picked.el)) {
+      picked.el.insertAdjacentElement('afterend', badge);
+      recordBadgeStats(info);
+      return;
+    }
+
+    const lockup = card.querySelector('.job-card-list__entity-lockup, .job-card-container');
+    (lockup || card).appendChild(badge);
+    recordBadgeStats(info);
+    return;
+  }
+
+  if (detailCompany) {
+    detailCompany.insertAdjacentElement('afterend', badge);
+  } else if (anchor?.parentElement) {
     anchor.parentElement.appendChild(badge);
   } else {
     card.insertBefore(badge, card.firstChild);
   }
+
+  recordBadgeStats(info);
+}
+
+function recordBadgeStats(info) {
+  sessionJobsScanned++;
+  if (info.sponsors) sessionSponsorsFound++;
+
+  safeStorageSet({
+    jobsScanned: sessionJobsScanned,
+    sponsorsFound: sessionSponsorsFound,
+  });
+
+  chrome.runtime.sendMessage({
+    action: 'statsUpdate',
+    data: {
+      jobsScanned: sessionJobsScanned,
+      sponsorsFound: sessionSponsorsFound,
+    },
+  }).catch(() => {});
 }
 
 
@@ -449,11 +1164,10 @@ function addBadge(card, info) {
 // ─────────────────────────────────────────────
 
 function scheduleInitialPasses() {
-  processJobs();
-  setTimeout(processJobs, 300);
-  setTimeout(processJobs, 800);
-  setTimeout(processJobs, 1800);
-  setTimeout(processJobs, 3500);
+  const delays = [0, 300, 800, 1800, 3500, 6000];
+  for (const ms of delays) {
+    setTimeout(processJobs, ms);
+  }
 }
 
 function start() {
@@ -473,10 +1187,20 @@ function mutationLooksLikeJobContent(mutations) {
   for (const m of mutations) {
     for (const node of m.addedNodes) {
       if (node.nodeType !== 1) continue;
-      if (node.matches?.('[data-job-id]')) return true;
-      if (node.querySelector?.('[data-job-id]')) return true;
-      if (node.matches?.("a[href*='/company/']")) return true;
-      if (node.querySelector?.("a[href*='/company/']")) return true;
+      if (node.matches?.('[data-job-id], [data-occludable-job-id]')) return true;
+      if (node.querySelector?.('[data-job-id], [data-occludable-job-id]')) return true;
+      if (node.matches?.('.jobs-unified-top-card, .job-details-jobs-unified-top-card')) return true;
+      if (node.querySelector?.('.jobs-unified-top-card, .job-details-jobs-unified-top-card')) {
+        return true;
+      }
+      if (node.matches?.('.jobs-search-results-list__list-item, .job-card-list__entity-lockup')) {
+        return true;
+      }
+      if (node.querySelector?.('.jobs-search-results-list__list-item, .job-card-list__entity-lockup')) {
+        return true;
+      }
+      if (node.matches?.("a[href*='/jobs/view/'], a[href*='/company/']")) return true;
+      if (node.querySelector?.("a[href*='/jobs/view/'], a[href*='/company/']")) return true;
     }
   }
   return false;

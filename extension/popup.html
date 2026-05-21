@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=340" />
+  <title>SponsorScope.ai</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      width: 340px;
+      max-width: 340px;
+      overflow-x: hidden;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .header-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      box-shadow: 0 2px 8px rgba(37, 99, 235, 0.15);
+    }
+
+    .header-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #0f172a;
+      line-height: 1.25;
+    }
+
+    .header-subtitle {
+      font-size: 11px;
+      color: #64748b;
+      margin-top: 2px;
+      line-height: 1.35;
+    }
+
+    .tips-wrap {
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .tips {
+      padding: 0 16px 12px;
+    }
+
+    .tips summary {
+      list-style: none;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      color: #2563eb;
+      padding: 12px 0 8px;
+      user-select: none;
+    }
+
+    .tips summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .tips summary::before {
+      content: '▸ ';
+      display: inline-block;
+      transition: transform 0.2s ease;
+    }
+
+    .tips[open] summary::before {
+      transform: rotate(90deg);
+    }
+
+    .tips-body {
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.28s ease, opacity 0.2s ease;
+      opacity: 0;
+    }
+
+    .tips[open] .tips-body {
+      max-height: 160px;
+      opacity: 1;
+    }
+
+    .tips-box {
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+
+    .tips-box p {
+      font-size: 11px;
+      color: #1e40af;
+      line-height: 1.55;
+      margin-bottom: 6px;
+    }
+
+    .tips-box p:last-child {
+      margin-bottom: 0;
+    }
+
+    .tips-box p::before {
+      content: '→ ';
+      font-weight: 600;
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .toggle-label {
+      font-size: 13px;
+      font-weight: 700;
+      color: #0f172a;
+    }
+
+    .toggle-hint {
+      font-size: 11px;
+      color: #64748b;
+      margin-top: 2px;
+    }
+
+    .toggle-switch {
+      position: relative;
+      width: 44px;
+      height: 24px;
+      flex-shrink: 0;
+    }
+
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+      position: absolute;
+    }
+
+    .toggle-track {
+      position: absolute;
+      inset: 0;
+      background: #cbd5e1;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+
+    .toggle-knob {
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 18px;
+      height: 18px;
+      background: #ffffff;
+      border-radius: 50%;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.2);
+      transition: transform 0.2s ease;
+      pointer-events: none;
+    }
+
+    .toggle-switch input:checked + .toggle-track {
+      background: #16a34a;
+    }
+
+    .toggle-switch input:checked + .toggle-track .toggle-knob {
+      transform: translateX(20px);
+    }
+
+    .toggle-switch input:focus-visible + .toggle-track {
+      outline: 2px solid #2563eb;
+      outline-offset: 2px;
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #94a3b8;
+      padding: 10px 16px 6px;
+      background: #ffffff;
+    }
+
+    .legend {
+      background: #ffffff;
+      padding: 0 16px 10px;
+      border-bottom: 1px solid #e2e8f0;
+    }
+
+    .legend-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .legend-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .legend-pill {
+      display: inline-block;
+      flex-shrink: 0;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 20px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    .legend-pill.yes {
+      background: #dcfce7;
+      color: #15803d;
+      border: 1px solid #86efac;
+    }
+
+    .legend-pill.no {
+      background: #fee2e2;
+      color: #b91c1c;
+      border: 1px solid #fca5a5;
+    }
+
+    .legend-desc {
+      font-size: 11px;
+      color: #64748b;
+      line-height: 1.4;
+    }
+
+    .stats {
+      display: flex;
+      align-items: stretch;
+      background: #ffffff;
+      padding: 10px 16px 16px;
+    }
+
+    .stat-block {
+      flex: 1;
+      text-align: center;
+      padding: 4px 8px;
+    }
+
+    .stat-divider {
+      width: 1px;
+      background: #e2e8f0;
+      align-self: stretch;
+      margin: 4px 0;
+    }
+
+    .stat-number {
+      font-size: 28px;
+      font-weight: 700;
+      color: #0f172a;
+      line-height: 1.1;
+    }
+
+    .stat-label {
+      font-size: 10px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #64748b;
+      margin-top: 4px;
+    }
+
+    .footer {
+      text-align: center;
+      font-size: 10px;
+      color: #94a3b8;
+      padding: 8px 12px;
+      background: #f8fafc;
+    }
+
+    .footer a {
+      color: #2563eb;
+      text-decoration: none;
+    }
+
+    .footer a:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <img class="header-icon" src="icons/icon32.png" width="36" height="36" alt="" />
+    <div>
+      <div class="header-title">SponsorScope.ai</div>
+      <p class="header-subtitle">H1B Sponsorship Intel for LinkedIn</p>
+    </div>
+  </header>
+
+  <div class="tips-wrap">
+    <details class="tips">
+      <summary>How it works</summary>
+      <div class="tips-body">
+        <div class="tips-box">
+          <p>Browse any LinkedIn jobs page — badges appear automatically.</p>
+          <p>Green means DOL data shows active H-1B LCA filings.</p>
+          <p>Red means none found — always verify with the employer.</p>
+          <p>Toggle scanning off anytime without uninstalling.</p>
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <div class="toggle-row">
+    <div>
+      <div class="toggle-label">Scan Jobs</div>
+      <div class="toggle-hint">Auto-detect sponsorship status</div>
+    </div>
+    <label class="toggle-switch">
+      <input type="checkbox" id="scanToggle" checked />
+      <span class="toggle-track"><span class="toggle-knob"></span></span>
+    </label>
+  </div>
+
+  <p class="section-title">Badge Guide</p>
+  <section class="legend" aria-label="Badge guide">
+    <div class="legend-row">
+      <span class="legend-pill yes">✓ Sponsors H1B</span>
+      <span class="legend-desc">Active LCA filings found in DOL data</span>
+    </div>
+    <div class="legend-row">
+      <span class="legend-pill no">✗ Not Found</span>
+      <span class="legend-desc">No recent filings — verify manually</span>
+    </div>
+  </section>
+
+  <p class="section-title">Session Stats</p>
+  <section class="stats" aria-label="Session statistics">
+    <div class="stat-block">
+      <div class="stat-number" id="jobsCount">0</div>
+      <div class="stat-label">Scanned</div>
+    </div>
+    <div class="stat-divider" aria-hidden="true"></div>
+    <div class="stat-block">
+      <div class="stat-number" id="sponsorsCount">0</div>
+      <div class="stat-label">Sponsors Found</div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    Powered by DOL LCA data ·
+    <a href="https://github.com/ggggzj/H1B_Checker" target="_blank" rel="noopener noreferrer">GitHub</a>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

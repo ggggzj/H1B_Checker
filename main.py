@@ -36,9 +36,12 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"chrome-extension://.*",
-    allow_origins=["*"],
+    allow_origins=[
+        "https://www.linkedin.com",
+        "https://linkedin.com",
+    ],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -115,20 +118,27 @@ class SelectorMissReport(BaseModel):
 
 # Remote extension config (also embedded in content.js as fallbacks).
 # Primary company detection uses /company/{slug} URLs — CSS lists are backup only.
-EXTENSION_CONFIG_VERSION = "1.0.5"
+EXTENSION_CONFIG_VERSION = "1.0.6"
 EXTENSION_COMPANY_SELECTORS: List[str] = [
+    ".job-card-container__company-name",
+    ".job-card-container__primary-description",
+    "[class*='job-card-list__company-name']",
+    ".job-card-list__entity-lockup .artdeco-entity-lockup__subtitle",
     ".artdeco-entity-lockup__subtitle div[dir='ltr']",
     ".artdeco-entity-lockup__subtitle",
-    ".job-card-container__company-name",
     ".base-search-card__subtitle",
     ".base-card__subtitle",
     ".base-main-card__subtitle",
+    ".jobs-unified-top-card__company-name",
+    ".job-details-jobs-unified-top-card__company-name",
 ]
 EXTENSION_JOB_CARD_SELECTORS: List[str] = [
-    "[data-job-id]",
-    "li.jobs-search-results__list-item",
-    ".job-card-list__entity-lockup",
+    "[data-occludable-job-id]",
     ".jobs-search-results-list__list-item",
+    "li.jobs-search-results__list-item",
+    "li.scaffold-layout__list-item",
+    ".job-card-list__entity-lockup",
+    "[data-job-id]",
 ]
 
 # ============ Semantic search (Layer 4 fallback) ====================

@@ -32,6 +32,7 @@ For users who prefer not to wait for Web Store review, or who want to inspect th
 |------|------|
 | `manifest.json` | MV3 manifest, minimal permissions |
 | `content.js` | DOM helpers, `fetch` to `/check`, remote selectors via `/config` |
+| `popup.html` / `popup.js` | SponsorScope.ai control panel (toggle, stats, guide) |
 | `style.css` | Badge styles |
 | `icons/` | `16`, `32`, `48`, `128` PNG assets |
 | `privacy-policy.html` | Local copy of the privacy policy (host a public copy for the Web Store) |

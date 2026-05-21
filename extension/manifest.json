@@ -2,13 +2,24 @@
   "manifest_version": 3,
   "name": "H1B Checker for LinkedIn Jobs",
   "short_name": "H1B Checker",
-  "version": "1.0.5",
+  "version": "1.0.20",
   "description": "See if a company sponsors H1B visas while browsing LinkedIn jobs, based on official US DOL LCA disclosure data.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "activeTab"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SponsorScope.ai",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
   "host_permissions": [
     "https://www.linkedin.com/jobs/*",
     "https://h1bchecker-production.up.railway.app/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": ["https://www.linkedin.com/jobs/*"],
