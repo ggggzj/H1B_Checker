@@ -15,13 +15,13 @@ The badge is one of two:
 
 ### Option A — Chrome Web Store (recommended)
 
-The Web Store listing is currently under review. Once approved, you'll be able to install with one click:
+Install with one click from the Chrome Web Store:
 
-> ⏳ _Pending review — link will be added here when published._
+👉 **[H1B Checker for LinkedIn Jobs](https://chromewebstore.google.com/detail/h1b-checker-for-linkedin/fjlefpeahmeahjbadnnogdnailahdafe)**
 
-If you'd like to use the extension right now, follow **Option B** below.
+Updates from the store are automatic after you install.
 
-### Option B — Install manually from GitHub (works today)
+### Option B — Install manually from GitHub
 
 You only need to do this once. It takes about 1 minute.
 
@@ -41,7 +41,7 @@ You only need to do this once. It takes about 1 minute.
    chrome://extensions
    ```
 
-y4. **Turn on Developer mode.**  
+4. **Turn on Developer mode.**  
    Toggle the **Developer mode** switch in the top-right corner of the page to **ON**.
 
 5. **Load the extension.**  
@@ -82,13 +82,13 @@ The same steps work on browsers built on Chromium:
 
 ## Updating the extension
 
-Whenever a new version is released:
+**If you installed from the Chrome Web Store:** Chrome updates the extension automatically (you can also open `chrome://extensions` and click **Update**).
+
+**If you installed manually (Option B):**
 
 1. Download the new `h1b-checker-extension.zip` from <https://github.com/ggggzj/H1B_Checker/releases/latest>.
 2. Unzip it (you can overwrite the old folder).
 3. Open `chrome://extensions`, find **H1B Checker for LinkedIn Jobs**, and click the small **circular arrow** (refresh) icon on that card.
-
-Once the extension is available on the Chrome Web Store, updates will be automatic and you can skip these steps.
 
 ---
 
