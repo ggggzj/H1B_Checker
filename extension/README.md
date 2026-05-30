@@ -6,13 +6,13 @@ Chrome extension (Manifest V3) that shows a simple H1B sponsorship indicator on 
 
 ### Option A — Chrome Web Store (recommended for end users)
 
-> Replace the link below once the listing is approved.
+[Install from the Chrome Web Store](https://chromewebstore.google.com/detail/h1b-checker-for-linkedin/fjlefpeahmeahjbadnnogdnailahdafe)
 
-[Install from the Chrome Web Store](https://chromewebstore.google.com/detail/REPLACE_WITH_EXTENSION_ID)
+Updates from the store are automatic after install.
 
 ### Option B — Manual install from GitHub release
 
-For users who prefer not to wait for Web Store review, or who want to inspect the code first:
+For developers or users who want to inspect or modify the source:
 
 1. Download **`h1b-checker-extension.zip`** from the latest release:
    <https://github.com/ggggzj/H1B_Checker/releases/latest/download/h1b-checker-extension.zip>
@@ -31,7 +31,8 @@ For users who prefer not to wait for Web Store review, or who want to inspect th
 | File | Role |
 |------|------|
 | `manifest.json` | MV3 manifest, minimal permissions |
-| `content.js` | DOM helpers, `fetch` to `/check`, remote selectors via `/config` |
+| `background.js` | Service worker — proxies API calls (avoids page CORS) |
+| `content.js` | DOM helpers, badges, remote selectors via `/config` |
 | `popup.html` / `popup.js` | SponsorScope.ai control panel (toggle, stats, guide) |
 | `style.css` | Badge styles |
 | `icons/` | `16`, `32`, `48`, `128` PNG assets |
@@ -52,7 +53,7 @@ For users who prefer not to wait for Web Store review, or who want to inspect th
 ## Customize
 
 - Replace `author` and `homepage_url` in `manifest.json` if your GitHub account or repo URL differs.
-- Point `API_URL` in `content.js` to your deployment.
+- Point `API_URL` in `content.js` and `background.js` to your deployment.
 
 ## LinkedIn DOM changes
 
