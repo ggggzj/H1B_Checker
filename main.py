@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fuzzywuzzy import fuzz
 from openai import OpenAI
@@ -53,6 +53,30 @@ def _get_openai_client() -> OpenAI:
     if _openai_client is None:
         _openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     return _openai_client
+
+
+# ============ API key auth (denial-of-wallet protection) ============
+# Set API_KEY in the server environment (Railway → Variables) to require callers
+# to send a matching X-API-Key header. The Chrome extension sends this header via
+# background.js. Protects the OpenAI-backed /check and the heavy /search.
+#
+# NOTE: When API_KEY is unset, auth is DISABLED (open) so deploying this code does
+# not lock out the service before the env var is set. You MUST set API_KEY on the
+# server to actually be protected. The key shipped inside the extension is only weak
+# protection (extensions can be unpacked) — pair it with rate limiting + the OpenAI
+# budget cap for real safety.
+API_KEY = os.environ.get("API_KEY")
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    """FastAPI dependency: reject requests without a valid X-API-Key header."""
+    if not API_KEY:
+        logger.warning(
+            "require_api_key: API_KEY env not set — auth is DISABLED (open endpoint)"
+        )
+        return
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 @app.on_event("startup")
@@ -374,6 +398,7 @@ def _employer_to_check_response(
 async def check_employer(
     company: str = Query(..., min_length=1, description="Company name"),
     db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
 ):
     """
     Check whether a company sponsors H1B (four-layer resolution).
@@ -441,7 +466,8 @@ async def check_employer(
 async def search_employers(
     q: str = Query(..., min_length=1, description="Search keyword"),
     limit: int = Query(5, ge=1, le=50, description="Max results"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(require_api_key),
 ):
     """
     Fuzzy search employers (for autocomplete).
@@ -510,6 +536,17 @@ async def report_selector_miss(report: SelectorMissReport):
         snippet,
     )
     return {"ok": True}
+
+
+# ============ Ask (RAG - step 1: just say hello) ============
+
+@app.get("/ask")
+async def ask(question: str = Query(..., description="A question from the user")):
+    """Step 1: returns a fixed reply. No AI yet. We test that it works first."""
+    return {
+        "question": question,
+        "answer": "Hello! The /ask endpoint works. AI is not added yet.",
+    }
 
 
 # ============ Health ============
