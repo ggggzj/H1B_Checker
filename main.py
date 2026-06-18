@@ -4,32 +4,58 @@ FastAPI H1B Checker API
 - GET /search?q=amazon&limit=5    → fuzzy search (autocomplete)
 """
 
-import json
 import logging
-import math
 import os
-from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, Depends, Query, Header, HTTPException
+from fastapi import FastAPI, Depends, Query, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fuzzywuzzy import fuzz
-from openai import OpenAI
 from pydantic import BaseModel
-from sqlalchemy import text
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
 
 from clean_data import normalize_employer
 from database import get_db
-from models import Employer, EmployerAlias
+from models import Employer
+from resolution import EmployerResolver, OpenAIEmbedder, Resolution, SqlEmployerRepo
 
 app = FastAPI(
     title="H1B Checker API",
     description="Look up employers with certified H1B LCA data",
     version="1.0.0"
 )
+
+# ============ Rate limiting (denial-of-wallet protection) ============
+# Cap the expensive endpoints per client IP. /check can reach OpenAI in Layer 4
+# (semantic search) and /search scans the table, so an attacker hammering random
+# names would otherwise burn the OpenAI budget and CPU.
+#
+# We key by IP, NOT by API key: the extension ships ONE shared key for every
+# install, so keying by key would lump all users into a single bucket and throttle
+# everyone at once. Each real user has their own IP, so per-IP limits isolate an
+# abuser to their own address.
+#
+# Storage is in-memory (per process) — fine for a single Railway instance. If you
+# scale to multiple instances/workers, the counts won't be shared; switch to a
+# common store via Limiter(storage_uri="redis://...").
+
+
+def _client_ip(request: Request) -> str:
+    """Real client IP, honoring the X-Forwarded-For header Railway sits behind."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        # First entry is the original client; later entries are proxies.
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+limiter = Limiter(key_func=_client_ip)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Allow Chrome extensions and browser clients to call the API.
 # Chrome extensions send Origin: chrome-extension://<id>
@@ -44,16 +70,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
-_openai_client: Optional[OpenAI] = None
-
-
-def _get_openai_client() -> OpenAI:
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    return _openai_client
-
 
 # ============ API key auth (denial-of-wallet protection) ============
 # Set API_KEY in the server environment (Railway → Variables) to require callers
@@ -165,305 +181,75 @@ EXTENSION_JOB_CARD_SELECTORS: List[str] = [
     "[data-job-id]",
 ]
 
-# ============ Semantic search (Layer 4 fallback) ====================
+# Default semantic similarity threshold for the resolution module's Layer 4.
+# NOTE: git history (c2c3b19) intended to lower this from 0.75 to 0.65, but the deployed
+# code kept 0.75. Override per-environment with SEMANTIC_THRESHOLD without a redeploy.
+SEMANTIC_THRESHOLD = float(os.getenv("SEMANTIC_THRESHOLD", "0.75"))
 
 
-def _embedding_to_pg_vector_literal(values: list[float]) -> str:
-    """Serialize embedding for PostgreSQL vector cast (JSON array syntax)."""
-    return json.dumps([float(x) for x in values])
+# ============ Resolution wiring ============
 
-
-@lru_cache(maxsize=1000)
-def _embedding_lru_cached(text_key: str) -> tuple[float, ...]:
-    """
-    OpenAI embedding for text_key, cached by exact string.
-    Returns an immutable tuple so lru_cache can store it safely.
-    Raises on API/network errors (not cached).
-    """
-    client = _get_openai_client()
-    response = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=text_key,
+def get_resolver(db: Session = Depends(get_db)) -> EmployerResolver:
+    """Single composition point: wire the Postgres + OpenAI adapters behind the seams."""
+    return EmployerResolver(
+        SqlEmployerRepo(db),
+        OpenAIEmbedder(),
+        similarity_threshold=SEMANTIC_THRESHOLD,
     )
-    emb = response.data[0].embedding
-    return tuple(float(x) for x in emb)
 
 
-def get_embedding_cached(text_key: str) -> Optional[list[float]]:
-    """
-    Embedding for normalized company name with LRU cache on success.
-    Failures are not cached.
-    """
-    try:
-        return list(_embedding_lru_cached(text_key))
-    except Exception as e:
-        print(f"⚠️  OpenAI API error (get_embedding_cached): {e}")
-        return None
-
-
-# Layer 4: fetch more neighbors than we return, then re-rank when scores bunch up.
-_SEMANTIC_FETCH_LIMIT = 10
-# When top-1 and top-2 cosine similarities are within this gap, break ties using
-# certified LCA volume (similarity * log1p(h1b_count)).
-_SIM_TIGHT_SCORE_GAP = 0.04
-# Reject semantic hits that are "almost tied" with the runner-up (too noisy).
-_AMBIGUITY_REJECT_MARGIN = 0.04
-
-
-def _rerank_semantic_candidates(
-    rows: list,
-    similarity_threshold: float,
-) -> list:
-    """
-    If the top vector hits are very close in score, prefer the employer with more
-    certified filings (McKinsey-style: small shell vs main partnership).
-
-    Never promotes a row whose similarity would fall below ``similarity_threshold``;
-    in that case the original vector order is kept.
-    """
-    if len(rows) < 2:
-        return rows
-    s0 = float(rows[0]["similarity"])
-    s1 = float(rows[1]["similarity"])
-    if s0 - s1 >= _SIM_TIGHT_SCORE_GAP:
-        return rows
-    floor = max(similarity_threshold - 0.05, min(s0, s1) - 0.02)
-    pool = [r for r in rows[:6] if float(r["similarity"]) >= floor]
-    if len(pool) < 2:
-        return rows
-    best = max(
-        pool,
-        key=lambda r: float(r["similarity"])
-        * math.log1p(max(int(r["total_h1b_certified"] or 0), 0)),
+def to_check_response(res: Resolution) -> CheckResponse:
+    """Map a Resolution to the HTTP response the Chrome extension expects."""
+    if res.record is None:
+        return CheckResponse(
+            found=False,
+            sponsors_h1b=False,
+            # Echo "invalid_input" so callers can tell a rejected query from a clean miss.
+            match_type=res.match_type if res.match_type == "invalid_input" else None,
+            match_confidence=res.confidence,
+        )
+    e = res.record
+    return CheckResponse(
+        found=True,
+        employer_name=e.employer_name,
+        # Expose total_h1b_certified as h1b_count so the Chrome extension
+        # doesn't need to change its field name
+        h1b_count=e.total_h1b_certified,
+        sponsors_h1b=True,
+        match_type=res.match_type,
+        match_confidence=res.confidence,
+        earliest_decision_date=e.earliest_decision_date,
+        latest_decision_date=e.latest_decision_date,
+        last_active_year=e.last_active_year,
+        h1b_dependent=e.h1b_dependent,
     )
-    if float(best["similarity"]) < similarity_threshold:
-        return rows
-    if best["id"] == rows[0]["id"]:
-        return rows
-    return [best] + [r for r in rows if r["id"] != best["id"]]
-
-
-def semantic_search(
-    query: str,
-    db: Session,
-    similarity_threshold: float = 0.75,
-    top_k: int = 3,
-) -> Tuple[Optional[Employer], float, bool]:
-    """
-    pgvector cosine distance (<=>); similarity score = 1 - distance.
-
-    Returns (best_employer | None, top1_similarity, is_ambiguous).
-
-    Logs Layer 4 activity at INFO (flow / outcomes) and WARNING (failures)
-    for monitoring and debugging. Enable with e.g. LOG_LEVEL=INFO on Railway.
-    """
-    logger.info(
-        "semantic_search start query=%r fetch_limit=%s similarity_threshold=%s",
-        query,
-        _SEMANTIC_FETCH_LIMIT,
-        similarity_threshold,
-    )
-    try:
-        query_emb = get_embedding_cached(query)
-        if not query_emb:
-            logger.warning(
-                "semantic_search skip query=%r reason=no_query_embedding",
-                query,
-            )
-            return None, 0.0, False
-
-        vec_lit = _embedding_to_pg_vector_literal(query_emb)
-        sql = text(
-            """
-            SELECT
-                id,
-                employer_name,
-                total_h1b_certified,
-                1 - (embedding <=> CAST(:emb AS vector)) AS similarity
-            FROM employers
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> CAST(:emb AS vector)
-            LIMIT :k
-            """
-        )
-        results = list(
-            db.execute(
-                sql, {"emb": vec_lit, "k": _SEMANTIC_FETCH_LIMIT}
-            ).mappings().all()
-        )
-
-        if not results:
-            logger.info(
-                "semantic_search miss query=%r reason=no_rows_with_embedding",
-                query,
-            )
-            return None, 0.0, False
-
-        results = _rerank_semantic_candidates(results, similarity_threshold)
-
-        top1_score = float(results[0]["similarity"])
-        is_ambiguous = False
-        margin: Optional[float] = None
-        if len(results) > 1:
-            top2_score = float(results[1]["similarity"])
-            margin = top1_score - top2_score
-            if margin < 0.1:
-                is_ambiguous = True
-
-        preview = [
-            {
-                "id": int(r["id"]),
-                "employer_name": r["employer_name"],
-                "similarity": round(float(r["similarity"]), 4),
-            }
-            for r in results[: max(top_k, 5)]
-        ]
-        logger.info(
-            "semantic_search candidates query=%r top=%s ambiguous=%s margin=%s",
-            query,
-            preview,
-            is_ambiguous,
-            round(margin, 4) if margin is not None else None,
-        )
-
-        if top1_score < similarity_threshold:
-            logger.info(
-                "semantic_search miss query=%r reason=below_threshold "
-                "top1_similarity=%.4f threshold=%.2f ambiguous=%s",
-                query,
-                top1_score,
-                similarity_threshold,
-                is_ambiguous,
-            )
-            return None, top1_score, is_ambiguous
-
-        if is_ambiguous and margin is not None and margin < _AMBIGUITY_REJECT_MARGIN:
-            logger.info(
-                "semantic_search miss query=%r reason=ambiguous_tight_margin "
-                "top1_similarity=%.4f margin=%.4f",
-                query,
-                top1_score,
-                margin,
-            )
-            return None, top1_score, True
-
-        best_match = db.query(Employer).filter(Employer.id == results[0]["id"]).first()
-        logger.info(
-            "semantic_search hit query=%r employer_id=%s employer_name=%r "
-            "similarity=%.4f ambiguous=%s",
-            query,
-            results[0]["id"],
-            results[0]["employer_name"],
-            top1_score,
-            is_ambiguous,
-        )
-        return best_match, top1_score, is_ambiguous
-
-    except Exception as e:
-        logger.warning("semantic_search error query=%r err=%s", query, e, exc_info=True)
-        return None, 0.0, False
 
 
 # ============ API routes ============
 
-def _employer_to_check_response(
-    employer: Employer,
-    match_type: str = "exact",
-    match_confidence: float = 1.0,
-) -> CheckResponse:
-    """Convert an Employer ORM row into a CheckResponse dict."""
-    return CheckResponse(
-        found=True,
-        employer_name=employer.employer_name,
-        # Expose total_h1b_certified as h1b_count so the Chrome extension
-        # doesn't need to change its field name
-        h1b_count=employer.total_h1b_certified,
-        sponsors_h1b=True,
-        match_type=match_type,
-        match_confidence=match_confidence,
-        earliest_decision_date=(
-            str(employer.earliest_decision_date)
-            if employer.earliest_decision_date else None
-        ),
-        latest_decision_date=(
-            str(employer.latest_decision_date)
-            if employer.latest_decision_date else None
-        ),
-        last_active_year=employer.last_active_year,
-        h1b_dependent=employer.h1b_dependent,
-    )
-
 
 @app.get("/check", response_model=CheckResponse)
+@limiter.limit("120/minute;2000/hour")
 async def check_employer(
+    request: Request,
     company: str = Query(..., min_length=1, description="Company name"),
-    db: Session = Depends(get_db),
+    resolver: EmployerResolver = Depends(get_resolver),
     _: None = Depends(require_api_key),
 ):
     """
     Check whether a company sponsors H1B (four-layer resolution).
 
-    Lookup order:
-      1. Exact match on employer_name (normalized)
-      2. Alias lookup (TRADE_NAME_DBA) → primary employer
-      3. ILIKE substring match on employer_name
-      4. Semantic search (pgvector) when 1–3 miss
+    Lookup order: exact → alias (DBA) → ILIKE substring → semantic (pgvector).
 
     Example: /check?company=Google
     """
-    company_normalized = normalize_employer(company)
-    if not company_normalized:
-        return CheckResponse(
-            found=False,
-            sponsors_h1b=False,
-            match_type="invalid_input",
-            match_confidence=None,
-        )
-
-    # 1) Exact match on the canonical employer name
-    employer = db.query(Employer).filter(
-        Employer.employer_name == company_normalized
-    ).first()
-    if employer:
-        return _employer_to_check_response(employer, match_type="exact")
-
-    # 2) Alias lookup — check if the name is a known DBA / trade name
-    alias = db.query(EmployerAlias).filter(
-        EmployerAlias.alias_name == company_normalized
-    ).first()
-    if alias:
-        primary = db.query(Employer).filter(
-            Employer.employer_name == alias.primary_employer_name
-        ).first()
-        if primary:
-            return _employer_to_check_response(primary, match_type="alias")
-
-    # 3) Substring (ILIKE) match — handles partial names like "Google" → "GOOGLE LLC"
-    fuzzy_match = db.query(Employer).filter(
-        Employer.employer_name.ilike(f"%{company_normalized}%")
-    ).order_by(Employer.total_h1b_certified.desc()).first()
-    if fuzzy_match:
-        return _employer_to_check_response(fuzzy_match, match_type="fuzzy")
-
-    # 4) Semantic fallback (requires OPENAI_API_KEY + pgvector embeddings on rows)
-    semantic_match, confidence, is_ambiguous = semantic_search(
-        company_normalized,
-        db,
-        similarity_threshold=0.75,
-    )
-    if semantic_match:
-        match_confidence = confidence * 0.9 if is_ambiguous else confidence
-        return _employer_to_check_response(
-            semantic_match,
-            match_type="semantic",
-            match_confidence=match_confidence,
-        )
-
-    return CheckResponse(found=False, sponsors_h1b=False)
+    return to_check_response(resolver.resolve(company))
 
 
 @app.get("/search", response_model=SearchResponse)
+@limiter.limit("30/minute;300/hour")
 async def search_employers(
+    request: Request,
     q: str = Query(..., min_length=1, description="Search keyword"),
     limit: int = Query(5, ge=1, le=50, description="Max results"),
     db: Session = Depends(get_db),
