@@ -893,6 +893,70 @@ function dedupeToInnermostCards(cards) {
   });
 }
 
+/**
+ * A genuine job card always carries one of: a /jobs/view/ link, a job id, or
+ * the detail top-card root. Page chrome the loose scanners can pick up — the
+ * left nav sidebar ("Groups", "Newsletters"), the "Jobs based on your
+ * preferences" header, people cards — has none of these, so requiring a job
+ * signal keeps badges on real listings only.
+ */
+function hasJobSignal(card) {
+  if (!card) return false;
+
+  // The job title link / job id usually lives on the enclosing list item, not
+  // on the inner wrapper the loose scanners return — so look up to it. The nav
+  // sidebar and the page header are not inside a job <li>, so they stay out.
+  const scope =
+    card.closest?.('[data-job-id], [data-occludable-job-id], li, [role="listitem"]') || card;
+
+  if (scope.matches?.('[data-job-id], [data-occludable-job-id]')) return true;
+  if (scope.querySelector?.('[data-job-id], [data-occludable-job-id]')) return true;
+  if (scope.querySelector?.('a[href*="/jobs/view/"]')) return true;
+
+  if (card.matches?.('.jobs-unified-top-card, .job-details-jobs-unified-top-card')) return true;
+  if (card.closest?.('.jobs-unified-top-card, .job-details-jobs-unified-top-card')) return true;
+  if (card.querySelector?.('.jobs-unified-top-card, .job-details-jobs-unified-top-card')) return true;
+
+  return false;
+}
+
+/**
+ * People/network suggestion cards ("People you may know", connections, search
+ * people results) look like job rows — name + "Title at Company" — but are not
+ * jobs. They carry a member profile link (/in/) or a Connect/Follow button and
+ * never a job link, so badges must not be added to them.
+ */
+function isPeopleCard(card) {
+  if (!card) return false;
+
+  // A real job card always has a job link or a job id; people cards never do.
+  const hasJobSignal =
+    card.matches?.('[data-job-id], [data-occludable-job-id]') ||
+    card.closest?.('[data-job-id], [data-occludable-job-id]') ||
+    card.querySelector?.('a[href*="/jobs/view/"]') ||
+    card.querySelector?.('.jobs-unified-top-card, .job-details-jobs-unified-top-card');
+  if (hasJobSignal) return false;
+
+  // Member profile link or a people-recommendation container ⇒ a person, not a job.
+  if (card.querySelector?.('a[href*="/in/"]')) return true;
+  if (
+    card.closest?.(
+      '.discover-entity-type-card, .pymk-card, [class*="discover"], ' +
+        '[componentkey*="PEOPLE"], [data-view-name*="people"]'
+    )
+  ) {
+    return true;
+  }
+
+  // Fallback: a Connect/Follow action with no job signal is a people card.
+  const actionText = card.textContent || '';
+  if (/\b(Connect|Follow|Message)\b/.test(actionText) && card.querySelector('button, a[role="button"]')) {
+    return true;
+  }
+
+  return false;
+}
+
 function findJobCards() {
   const seen = new Set();
   const cards = [];
@@ -912,7 +976,9 @@ function findJobCards() {
   merge(findAllLeafDataJobIdCards());
   merge(findJobCardsFromSelectors());
 
-  return dedupeToInnermostCards(cards);
+  return dedupeToInnermostCards(cards).filter(
+    (card) => hasJobSignal(card) && !isPeopleCard(card)
+  );
 }
 
 
