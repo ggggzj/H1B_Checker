@@ -1135,6 +1135,9 @@ function getH1BInfo(companyName) {
       return {
         sponsors: data.sponsors_h1b,
         count: data.h1b_count,
+        // "strong" | "weak" | "none" — drives the 3-tier badge. Falls back to
+        // null for older backends, in which case addBadge derives it from `sponsors`.
+        tier: data.tier ?? null,
       };
     } catch (error) {
       const msg = String(error?.message || error);
@@ -1152,12 +1155,29 @@ function getH1BInfo(companyName) {
   return promise;
 }
 
+// 3-tier badge styling, keyed by the backend's `tier` field.
+const TIER_BADGE = {
+  strong: { cls: 'h1b-strong', text: '🟢 Strong H1B sponsor' },
+  weak: { cls: 'h1b-weak', text: '🟡 Has sponsored before' },
+  none: { cls: 'h1b-none', text: '⚪ No H1B record' },
+};
+
+// Resolve a tier from the API payload. Prefer the backend's `tier`; fall back to
+// the legacy boolean so an old backend still renders something sensible.
+function resolveTier(info) {
+  if (info.tier && TIER_BADGE[info.tier]) return info.tier;
+  return info.sponsors ? 'weak' : 'none';
+}
+
 function addBadge(card, info) {
   if (card.querySelector('.h1b-badge')) return;
 
+  const tier = resolveTier(info);
+  const spec = TIER_BADGE[tier];
+
   const badge = document.createElement('div');
-  badge.className = `h1b-badge ${info.sponsors ? 'sponsor-yes' : 'sponsor-no'}`;
-  badge.textContent = info.sponsors ? '✓ Sponsors H1B' : '✗ Not Found';
+  badge.className = `h1b-badge ${spec.cls}`;
+  badge.textContent = spec.text;
 
   const anchor = cardCompanyAnchors.get(card);
   const listMode = isJobsListCard(card);

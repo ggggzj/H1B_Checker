@@ -122,6 +122,8 @@ class CheckResponse(BaseModel):
     latest_decision_date: Optional[str] = None
     last_active_year: Optional[int] = None
     h1b_dependent: Optional[bool] = None
+    # Deterministic 3-tier badge for the extension: "strong" | "weak" | "none".
+    tier: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -186,6 +188,16 @@ EXTENSION_JOB_CARD_SELECTORS: List[str] = [
 # code kept 0.75. Override per-environment with SEMANTIC_THRESHOLD without a redeploy.
 SEMANTIC_THRESHOLD = float(os.getenv("SEMANTIC_THRESHOLD", "0.75"))
 
+# ============ Tier classification thresholds ============
+# Deterministic 3-tier badge (strong / weak / none) derived from existing /check
+# fields — no extra DB work. Tunable per-environment like SEMANTIC_THRESHOLD so the
+# bar can move without a code change or extension republish.
+#
+# strong = recently active AND sizable AND trusted match; otherwise weak.
+TIER_RECENT_YEAR = int(os.getenv("TIER_RECENT_YEAR", "2024"))
+TIER_STRONG_MIN_COUNT = int(os.getenv("TIER_STRONG_MIN_COUNT", "5"))
+TIER_STRONG_SEMANTIC_CONF = float(os.getenv("TIER_STRONG_SEMANTIC_CONF", "0.85"))
+
 
 # ============ Resolution wiring ============
 
@@ -198,6 +210,29 @@ def get_resolver(db: Session = Depends(get_db)) -> EmployerResolver:
     )
 
 
+def classify_tier(res: Resolution) -> str:
+    """Bucket a resolution into a badge tier from fields already on the record.
+
+    Pure function of the Resolution — no DB, no network — so it is cheap to call and
+    trivial to unit-test. Returns one of: "none" | "weak" | "strong".
+
+      none   — nothing resolved (a miss or invalid input).
+      strong — recently active AND sizable AND a trusted match.
+      weak   — resolved, but too old / too small / only a soft semantic match.
+    """
+    e = res.record
+    if e is None:
+        return "none"
+    recent = (e.last_active_year or 0) >= TIER_RECENT_YEAR
+    sizable = (e.total_h1b_certified or 0) >= TIER_STRONG_MIN_COUNT
+    # exact/alias/fuzzy are name-anchored, so we trust them outright; a semantic
+    # match is only trusted once it clears the stronger confidence bar.
+    trusted = res.match_type in ("exact", "alias", "fuzzy") or (
+        res.match_type == "semantic" and (res.confidence or 0) >= TIER_STRONG_SEMANTIC_CONF
+    )
+    return "strong" if (recent and sizable and trusted) else "weak"
+
+
 def to_check_response(res: Resolution) -> CheckResponse:
     """Map a Resolution to the HTTP response the Chrome extension expects."""
     if res.record is None:
@@ -207,6 +242,7 @@ def to_check_response(res: Resolution) -> CheckResponse:
             # Echo "invalid_input" so callers can tell a rejected query from a clean miss.
             match_type=res.match_type if res.match_type == "invalid_input" else None,
             match_confidence=res.confidence,
+            tier="none",
         )
     e = res.record
     return CheckResponse(
@@ -222,6 +258,7 @@ def to_check_response(res: Resolution) -> CheckResponse:
         latest_decision_date=e.latest_decision_date,
         last_active_year=e.last_active_year,
         h1b_dependent=e.h1b_dependent,
+        tier=classify_tier(res),
     )
 
 
