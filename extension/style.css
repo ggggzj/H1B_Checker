@@ -13,16 +13,44 @@
   vertical-align: middle;
 }
 
-.h1b-badge.sponsor-yes {
+/* 🟢 Strong — recently active, sizable, trusted match */
+.h1b-badge.h1b-strong {
   background: #dcfce7;
   color: #15803d;
   border: 1px solid #86efac;
 }
 
-.h1b-badge.sponsor-no {
+/* 🟡 Weak — has sponsored before, but old / small / soft match */
+.h1b-badge.h1b-weak {
+  background: #fef9c3;
+  color: #a16207;
+  border: 1px solid #fde047;
+}
+
+/* ⚪ None — no H1B record found */
+.h1b-badge.h1b-none {
+  background: #f3f4f6;
+  color: #6b7280;
+  border: 1px solid #d1d5db;
+}
+
+/* 🔴 Per-posting — this JD explicitly denies sponsorship (detail panel only) */
+.h1b-badge.h1b-nosponsor {
   background: #fee2e2;
   color: #b91c1c;
   border: 1px solid #fca5a5;
+}
+
+/* Stacks the 🔴 badge and its historical-tier subtext under the company name */
+.h1b-nosponsor-wrap {
+  display: block;
+  margin: 4px 0 2px;
+}
+
+.h1b-nosponsor-sub {
+  font-size: 10px;
+  color: #6b7280;
+  margin-top: 2px;
 }
 
 /* Left job list — always show on its own line under company name */

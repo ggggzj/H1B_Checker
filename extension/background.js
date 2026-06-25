@@ -3,6 +3,19 @@
  */
 
 const API_URL = 'https://h1bchecker-production.up.railway.app';
+
+// API_KEY must match the server's API_KEY env var. It is loaded from config.js,
+// which is gitignored and NOT committed (copy config.example.js → config.js and
+// fill it in before packaging). It still ships inside the packaged extension, so
+// treat it as weak protection — the real denial-of-wallet guard is the server's
+// per-IP rate limit + OpenAI spend cap. Missing config.js → no key is sent.
+let API_KEY = '';
+try {
+  importScripts('config.js');
+  API_KEY = self.API_KEY || '';
+} catch (e) {
+  // config.js absent (e.g. fresh source checkout) — run without a key.
+}
 const DEFAULT_TIMEOUT_MS = 8000;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -21,7 +34,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const init = {
     method: message.method || 'GET',
     signal: controller.signal,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
+    },
   };
   if (message.body) init.body = JSON.stringify(message.body);
 

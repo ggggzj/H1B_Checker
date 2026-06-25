@@ -122,6 +122,8 @@ class CheckResponse(BaseModel):
     latest_decision_date: Optional[str] = None
     last_active_year: Optional[int] = None
     h1b_dependent: Optional[bool] = None
+    # Deterministic 3-tier badge for the extension: "strong" | "weak" | "none".
+    tier: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -143,10 +145,22 @@ class ExtensionSelectors(BaseModel):
     job_card: List[str]
 
 
+class NoSponsorRules(BaseModel):
+    """Regex sources (JS, case-insensitive) for the per-posting 🔴 "no sponsorship" badge.
+
+    The extension flags a posting only when a `negative` pattern matches AND no
+    `affirmative` pattern does — conservative on purpose (prefer a miss over a wrong
+    red badge that would scare a user off a job that does sponsor).
+    """
+    negative: List[str]
+    affirmative: List[str]
+
+
 class ExtensionConfigResponse(BaseModel):
     """Remote config for the LinkedIn content script."""
     version: str
     selectors: ExtensionSelectors
+    no_sponsor: NoSponsorRules
 
 
 class SelectorMissReport(BaseModel):
@@ -158,7 +172,7 @@ class SelectorMissReport(BaseModel):
 
 # Remote extension config (also embedded in content.js as fallbacks).
 # Primary company detection uses /company/{slug} URLs — CSS lists are backup only.
-EXTENSION_CONFIG_VERSION = "1.0.6"
+EXTENSION_CONFIG_VERSION = "1.1.0"
 EXTENSION_COMPANY_SELECTORS: List[str] = [
     ".job-card-container__company-name",
     ".job-card-container__primary-description",
@@ -181,10 +195,42 @@ EXTENSION_JOB_CARD_SELECTORS: List[str] = [
     "[data-job-id]",
 ]
 
+# Per-posting 🔴 "no sponsorship" rules — JS regex sources, case-insensitive, also
+# embedded in content.js as fallbacks. Hot-reloadable here when LinkedIn job-posting
+# wording shifts, without republishing the extension.
+#
+# A posting is flagged only if a NEGATIVE matches AND no AFFIRMATIVE does (conservative).
+EXTENSION_NO_SPONSOR_NEGATIVE: List[str] = [
+    r"\b(do(es)?\s+not|will\s+not|cannot|are\s+not\s+able\s+to|unable\s+to)\b[^.]{0,40}\bsponsor",
+    r"\bno\b[^.]{0,20}\b(visa\s+)?sponsorship\b",
+    r"\bwithout\b[^.]{0,30}\bsponsorship\b",
+    r"\bnot\s+(eligible|available)\b[^.]{0,20}\bsponsorship\b",
+    r"\b(US|U\.S\.)\s+citizen(ship)?\s+(is\s+)?required\b",
+    r"\bcitizenship\s+(is\s+)?required\b",
+    r"\bcitizens?\s+only\b",
+]
+EXTENSION_NO_SPONSOR_AFFIRMATIVE: List[str] = [
+    r"will\s+sponsor",
+    r"\bdo(es)?\s+sponsor",
+    r"sponsorship\s+(is\s+)?(available|provided|offered)",
+    r"(visa\s+)?sponsorship\s+available",
+    r"\bable\s+to\s+sponsor",
+]
+
 # Default semantic similarity threshold for the resolution module's Layer 4.
 # NOTE: git history (c2c3b19) intended to lower this from 0.75 to 0.65, but the deployed
 # code kept 0.75. Override per-environment with SEMANTIC_THRESHOLD without a redeploy.
 SEMANTIC_THRESHOLD = float(os.getenv("SEMANTIC_THRESHOLD", "0.75"))
+
+# ============ Tier classification thresholds ============
+# Deterministic 3-tier badge (strong / weak / none) derived from existing /check
+# fields — no extra DB work. Tunable per-environment like SEMANTIC_THRESHOLD so the
+# bar can move without a code change or extension republish.
+#
+# strong = recently active AND sizable AND trusted match; otherwise weak.
+TIER_RECENT_YEAR = int(os.getenv("TIER_RECENT_YEAR", "2024"))
+TIER_STRONG_MIN_COUNT = int(os.getenv("TIER_STRONG_MIN_COUNT", "5"))
+TIER_STRONG_SEMANTIC_CONF = float(os.getenv("TIER_STRONG_SEMANTIC_CONF", "0.85"))
 
 
 # ============ Resolution wiring ============
@@ -198,6 +244,29 @@ def get_resolver(db: Session = Depends(get_db)) -> EmployerResolver:
     )
 
 
+def classify_tier(res: Resolution) -> str:
+    """Bucket a resolution into a badge tier from fields already on the record.
+
+    Pure function of the Resolution — no DB, no network — so it is cheap to call and
+    trivial to unit-test. Returns one of: "none" | "weak" | "strong".
+
+      none   — nothing resolved (a miss or invalid input).
+      strong — recently active AND sizable AND a trusted match.
+      weak   — resolved, but too old / too small / only a soft semantic match.
+    """
+    e = res.record
+    if e is None:
+        return "none"
+    recent = (e.last_active_year or 0) >= TIER_RECENT_YEAR
+    sizable = (e.total_h1b_certified or 0) >= TIER_STRONG_MIN_COUNT
+    # exact/alias/fuzzy are name-anchored, so we trust them outright; a semantic
+    # match is only trusted once it clears the stronger confidence bar.
+    trusted = res.match_type in ("exact", "alias", "fuzzy") or (
+        res.match_type == "semantic" and (res.confidence or 0) >= TIER_STRONG_SEMANTIC_CONF
+    )
+    return "strong" if (recent and sizable and trusted) else "weak"
+
+
 def to_check_response(res: Resolution) -> CheckResponse:
     """Map a Resolution to the HTTP response the Chrome extension expects."""
     if res.record is None:
@@ -207,6 +276,7 @@ def to_check_response(res: Resolution) -> CheckResponse:
             # Echo "invalid_input" so callers can tell a rejected query from a clean miss.
             match_type=res.match_type if res.match_type == "invalid_input" else None,
             match_confidence=res.confidence,
+            tier="none",
         )
     e = res.record
     return CheckResponse(
@@ -222,6 +292,7 @@ def to_check_response(res: Resolution) -> CheckResponse:
         latest_decision_date=e.latest_decision_date,
         last_active_year=e.last_active_year,
         h1b_dependent=e.h1b_dependent,
+        tier=classify_tier(res),
     )
 
 
@@ -304,6 +375,10 @@ async def get_extension_config():
         selectors=ExtensionSelectors(
             company_name=EXTENSION_COMPANY_SELECTORS,
             job_card=EXTENSION_JOB_CARD_SELECTORS,
+        ),
+        no_sponsor=NoSponsorRules(
+            negative=EXTENSION_NO_SPONSOR_NEGATIVE,
+            affirmative=EXTENSION_NO_SPONSOR_AFFIRMATIVE,
         ),
     )
 

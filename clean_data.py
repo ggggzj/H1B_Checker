@@ -1,7 +1,7 @@
 """
 clean_data.py — H1B LCA Data Cleaning and ETL Pipeline
 
-Reads DOL FY2025 Q1-Q4 H-1B LCA Excel files, filters for certified H-1B cases,
+Reads DOL H-1B LCA Excel files (see FILES below), filters for certified H-1B cases,
 normalizes fields, deduplicates by CASE_NUMBER, and outputs three CSV files:
 
   output/employers.csv           — one row per unique employer with aggregated stats
@@ -12,7 +12,7 @@ Memory strategy:
   - Streams each Excel file with openpyxl read_only=True (no full load into RAM)
   - Deduplicates by CASE_NUMBER within each file before accumulating
   - Final merged dict holds only the 10 retained columns per record
-  - Peak RAM ≈ size of all unique certified H-1B cases across 4 files (~300K rows × 10 cols)
+  - Peak RAM ≈ size of all unique certified H-1B cases across all files (~700K rows × 10 cols)
 """
 
 import re
@@ -39,6 +39,7 @@ FILES = [
     "LCA_Disclosure_Data_FY2025_Q2.xlsx",
     "LCA_Disclosure_Data_FY2025_Q3.xlsx",
     "LCA_Disclosure_Data_FY2025_Q4.xlsx",
+    "LCA_Dislclosure_Data_FY2026_Q2.xlsx",   # cumulative FY2026 through 2026-03-31 (DOL filename typo: "Dislclosure")
 ]
 
 # Only these columns are kept from each row; all others are discarded
@@ -222,11 +223,19 @@ def process_file(file_path: Path) -> tuple[dict, int, int]:
     raw_headers = next(rows_iter)
     headers = [str(h).strip().upper() if h is not None else "" for h in raw_headers]
 
+    # Some columns were renamed across fiscal years. Map each canonical
+    # KEEP_COLS name to the alternate header spellings DOL has used.
+    # e.g. FY2025 used "H-1B_DEPENDENT"; FY2026 uses "H_1B_DEPENDENT".
+    COL_ALIASES = {
+        "H-1B_DEPENDENT": ["H-1B_DEPENDENT", "H_1B_DEPENDENT"],
+    }
+
     # Build a mapping from column name → integer index in each row tuple
     col_idx: dict[str, int | None] = {}
     for col in KEEP_COLS:
-        # Find the index of this column in the header row
-        found = next((i for i, h in enumerate(headers) if h == col), None)
+        # Accept any of the known header spellings for this column
+        accepted = COL_ALIASES.get(col, [col])
+        found = next((i for i, h in enumerate(headers) if h in accepted), None)
         col_idx[col] = found
         if found is None:
             print(f"   ⚠️  Column '{col}' not found in {file_path.name} — will be None")

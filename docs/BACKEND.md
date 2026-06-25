@@ -50,10 +50,11 @@ CREATE DATABASE h1b_checker;
 
 ### Step 3: Configure `.env`
 
-Edit `.env` with your connection string:
+Edit `.env` with your connection string and OpenAI key:
 
 ```env
 DATABASE_URL=postgresql://postgres:your_password@localhost:5432/h1b_checker
+OPENAI_API_KEY=sk-...
 ```
 
 **Replace:**
@@ -63,35 +64,45 @@ DATABASE_URL=postgresql://postgres:your_password@localhost:5432/h1b_checker
 - `5432` — port (default 5432)  
 - `h1b_checker` — database name  
 
+`OPENAI_API_KEY` is used to embed employer names for semantic matching (Step 5).
+The DB needs the `pgvector` extension; the scripts create it if your role has permission.
+
 ### Step 4: Prepare Excel files
 
-1. Download H1B LCA data (Excel) from the [U.S. Department of Labor](https://www.dol.gov/agencies/eta/foreign-labor/performance).  
-2. Place `.xlsx` files under `./data/`.
+1. Download the **LCA Programs (H-1B, H-1B1, E-3)** disclosure file from the
+   [U.S. Department of Labor](https://www.dol.gov/agencies/eta/foreign-labor/performance).
+   Download only the main file (named `LCA_Dislclosure_Data_*` — DOL misspells
+   "Disclosure"); the Appendix and Worksites files are not used.
+2. The quarterly files are **cumulative per fiscal year**, so you only need the
+   latest quarter of each fiscal year you want to cover.
+3. Place the `.xlsx` files under `./data/`, then list them in the `FILES` array
+   at the top of `clean_data.py`.
 
 ```bash
 ls -la data/
 # Example:
-# h1b_data_2023.xlsx
-# h1b_data_2024.xlsx
+# LCA_Disclosure_Data_FY2025_Q4.xlsx
+# LCA_Dislclosure_Data_FY2026_Q2.xlsx
 ```
 
-### Step 5: Import data
+### Step 5: Build the database
+
+The intake is three steps: clean the Excel into CSVs, load them into Postgres,
+then embed employer names for semantic matching.
 
 ```bash
-python process_data.py
+# 1. Clean + normalize the Excel files into 3 CSVs under output/
+python clean_data.py
+
+# 2. Load the CSVs into Postgres (employers upserted; job_levels & aliases rebuilt)
+python upload_to_railway.py
+
+# 3. Embed any employers missing a vector, then build the HNSW index
+python scripts/backfill_embeddings_fast.py
 ```
 
-**Example output (aligned with the English script):**
-
-```
-============================================================
-🚀 H1B data processing script
-============================================================
-📂 Found 2 xlsx file(s):
-...
-✅ All steps completed.
-============================================================
-```
+> Note: `process_data.py` is the older all-in-one script and is superseded by the
+> three steps above.
 
 ### Step 6: Run the API
 

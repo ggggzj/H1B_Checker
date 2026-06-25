@@ -18,3 +18,19 @@ output/
 
 # Local extension build artifact (releases attach this via CI)
 h1b-checker-extension.zip
+
+# Extension local secrets (API key) — copy config.example.js → config.js
+extension/config.js
+
+# Local DB backups (large dumps — keep off GitHub)
+backups/
+
+# Personal interview prep notes
+面试小抄.md
+面试答案讲义.md
+
+# Installed AI agent tooling (like node_modules — not project code)
+.agents/
+skills-lock.json
+AGENTS.md
+docs/agents/
