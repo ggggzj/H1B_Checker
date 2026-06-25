@@ -1340,16 +1340,21 @@ function detectNoSponsor(text) {
   return !noSponsorAffirmative.some((re) => re.test(text));
 }
 
-// Stable per-posting key so we evaluate each opened job once. Prefer LinkedIn's
-// currentJobId; fall back to JD length when the URL doesn't carry it.
+// Stable per-posting key so we evaluate each opened job once. We fold the JD length
+// into the key (not just currentJobId) on purpose: the URL's currentJobId flips
+// synchronously on a job switch, but #job-details keeps the PREVIOUS posting's text
+// for a few hundred ms while LinkedIn fetches the new one. Keying on the id alone
+// would stamp the new posting using the old JD and then lock that verdict in (the
+// dedup check short-circuits before the real JD ever loads). Including jd.length
+// makes that stale reading a different key, so it self-corrects once the JD updates.
 function currentPostingKey(jd) {
+  let id = '';
   try {
-    const id = new URL(window.location.href).searchParams.get('currentJobId');
-    if (id) return id;
+    id = new URL(window.location.href).searchParams.get('currentJobId') || '';
   } catch (_) {
-    /* malformed URL — fall through to length-based key */
+    /* malformed URL — fall through to length-only key */
   }
-  return `len:${jd.length}`;
+  return `${id}:len:${jd.length}`;
 }
 
 function renderDetailRedBadge(root, tier) {
