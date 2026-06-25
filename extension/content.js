@@ -65,8 +65,39 @@ const DETAIL_PANEL_ROOT_SELECTORS = [
   '.jobs-search__job-details',
 ];
 
+// Where the full job description lives — detail panel only (list cards have no JD text).
+const DETAIL_JD_SELECTORS = [
+  '#job-details',
+  '.jobs-description__content',
+  '.jobs-box__html-content',
+  'article.jobs-description__container',
+];
+
+// Per-posting 🔴 "no sponsorship" detection. Defaults here; /config can override them
+// (see applyExtensionConfig) so wording rules hot-update without republishing.
+// A posting is flagged only if a NEGATIVE matches AND no AFFIRMATIVE does — conservative
+// on purpose: a wrong red badge scares users off jobs that actually sponsor.
+const DEFAULT_NO_SPONSOR_NEGATIVE = [
+  /\b(do(es)?\s+not|will\s+not|cannot|are\s+not\s+able\s+to|unable\s+to)\b[^.]{0,40}\bsponsor/i,
+  /\bno\b[^.]{0,20}\b(visa\s+)?sponsorship\b/i,
+  /\bwithout\b[^.]{0,30}\bsponsorship\b/i,
+  /\bnot\s+(eligible|available)\b[^.]{0,20}\bsponsorship\b/i,
+  /\b(US|U\.S\.)\s+citizen(ship)?\s+(is\s+)?required\b/i,
+  /\bcitizenship\s+(is\s+)?required\b/i,
+  /\bcitizens?\s+only\b/i,
+];
+const DEFAULT_NO_SPONSOR_AFFIRMATIVE = [
+  /will\s+sponsor/i,
+  /\bdo(es)?\s+sponsor/i,
+  /sponsorship\s+(is\s+)?(available|provided|offered)/i,
+  /(visa\s+)?sponsorship\s+available/i,
+  /\bable\s+to\s+sponsor/i,
+];
+
 let companySelectors = [...DEFAULT_COMPANY_SELECTORS];
 let jobCardSelectors = [...DEFAULT_JOB_CARD_SELECTORS];
+let noSponsorNegative = [...DEFAULT_NO_SPONSOR_NEGATIVE];
+let noSponsorAffirmative = [...DEFAULT_NO_SPONSOR_AFFIRMATIVE];
 
 const cache = new Map();
 let apiHealthy = null;
@@ -200,6 +231,22 @@ function applySelectorList(list, fallback, assign) {
   return true;
 }
 
+// Compile config-delivered regex source strings into RegExp objects, skipping any
+// that are malformed or absurdly long. Returns [] if nothing valid was provided.
+function compileNoSponsorPatterns(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const src of list) {
+    if (typeof src !== 'string' || src.length === 0 || src.length > 300) continue;
+    try {
+      out.push(new RegExp(src, 'i'));
+    } catch (_) {
+      // ignore an invalid pattern rather than breaking the whole rule set
+    }
+  }
+  return out;
+}
+
 function applyExtensionConfig(config) {
   if (!config?.selectors) return false;
   let updated = false;
@@ -213,6 +260,20 @@ function applyExtensionConfig(config) {
     jobCardSelectors = v;
   })) {
     updated = true;
+  }
+  if (config.no_sponsor) {
+    // Only replace negatives if config gives at least one valid pattern, so a bad
+    // payload can't silently disable 🔴 detection. Affirmatives may legitimately be
+    // emptied (a more aggressive ruleset), so honor an explicit array as-is.
+    const neg = compileNoSponsorPatterns(config.no_sponsor.negative);
+    if (neg.length) {
+      noSponsorNegative = neg;
+      updated = true;
+    }
+    if (Array.isArray(config.no_sponsor.affirmative)) {
+      noSponsorAffirmative = compileNoSponsorPatterns(config.no_sponsor.affirmative);
+      updated = true;
+    }
   }
   return updated;
 }
@@ -1028,6 +1089,9 @@ async function mapWithConcurrency(items, limit, fn) {
 async function processJobs() {
   if (!filteringEnabled) return;
 
+  // 🔴 detail-panel scan runs every cycle, independent of the list-card flow below.
+  processDetailNoSponsor().catch(() => {});
+
   resetRemountedJobCards();
 
   let jobCards = findJobCards();
@@ -1242,6 +1306,113 @@ function recordBadgeStats(info) {
       sponsorsFound: sessionSponsorsFound,
     },
   }).catch(() => {});
+}
+
+
+// ─────────────────────────────────────────────
+// Per-posting 🔴 "no sponsorship" (detail panel only — needs the JD)
+// ─────────────────────────────────────────────
+
+const TIER_HISTORY_TEXT = {
+  strong: '🟢 History: strong sponsor',
+  weak: '🟡 History: has sponsored before',
+  none: '⚪ History: no H1B record',
+};
+
+function getDetailPanelRoot() {
+  return document.querySelector(
+    '.job-details-jobs-unified-top-card, .jobs-unified-top-card'
+  );
+}
+
+function getDetailJdText() {
+  for (const sel of DETAIL_JD_SELECTORS) {
+    const text = document.querySelector(sel)?.textContent?.trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+// Conservative: flag only when the JD denies sponsorship AND never affirms it.
+function detectNoSponsor(text) {
+  if (!text) return false;
+  if (!noSponsorNegative.some((re) => re.test(text))) return false;
+  return !noSponsorAffirmative.some((re) => re.test(text));
+}
+
+// Stable per-posting key so we evaluate each opened job once. Prefer LinkedIn's
+// currentJobId; fall back to JD length when the URL doesn't carry it.
+function currentPostingKey(jd) {
+  try {
+    const id = new URL(window.location.href).searchParams.get('currentJobId');
+    if (id) return id;
+  } catch (_) {
+    /* malformed URL — fall through to length-based key */
+  }
+  return `len:${jd.length}`;
+}
+
+function renderDetailRedBadge(root, tier) {
+  if (root.querySelector('.h1b-nosponsor-wrap')) return;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'h1b-nosponsor-wrap';
+
+  const red = document.createElement('div');
+  red.className = 'h1b-badge h1b-nosponsor';
+  red.textContent = '🔴 This posting: no sponsorship';
+  wrap.appendChild(red);
+
+  const histText = TIER_HISTORY_TEXT[tier];
+  if (histText) {
+    const sub = document.createElement('div');
+    sub.className = 'h1b-nosponsor-sub';
+    sub.textContent = histText;
+    wrap.appendChild(sub);
+  }
+
+  const company = root.querySelector(
+    '.job-details-jobs-unified-top-card__company-name, .jobs-unified-top-card__company-name'
+  );
+  if (company) company.insertAdjacentElement('afterend', wrap);
+  else root.insertBefore(wrap, root.firstChild);
+}
+
+// Scan the open detail panel's JD and, if it denies sponsorship, stamp a 🔴 badge with
+// the employer's historical tier as subtext. Runs independently of the list-card flow
+// (which FOCUS_LIST_BADGES_ONLY restricts to the left list), so 🔴 works even there.
+async function processDetailNoSponsor() {
+  if (!filteringEnabled) return;
+  const root = getDetailPanelRoot();
+  if (!root) return;
+
+  const jd = getDetailJdText();
+  if (!jd) return; // description not mounted yet — a later pass will retry
+
+  const key = currentPostingKey(jd);
+  if (root.dataset.h1bNosponsorKey === key) return; // already evaluated this posting
+  root.dataset.h1bNosponsorKey = key;
+
+  // Drop any stale badge left over from a previously-viewed posting in this root.
+  root.querySelectorAll('.h1b-nosponsor-wrap').forEach((el) => el.remove());
+
+  if (!detectNoSponsor(jd)) return;
+
+  // Best-effort historical tier subtext — the 🔴 badge itself never depends on the API.
+  let tier = null;
+  try {
+    const company = getCompanyFromDetailPanel(root);
+    if (company) {
+      const info = await getH1BInfo(company);
+      if (info) tier = info.tier ?? (info.sponsors ? 'weak' : 'none');
+    }
+  } catch (_) {
+    /* ignore — show the red badge regardless */
+  }
+
+  // The user may have switched postings during the await; bail if so.
+  if (root.dataset.h1bNosponsorKey !== key) return;
+  renderDetailRedBadge(root, tier);
 }
 
 

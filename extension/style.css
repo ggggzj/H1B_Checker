@@ -34,6 +34,25 @@
   border: 1px solid #d1d5db;
 }
 
+/* 🔴 Per-posting — this JD explicitly denies sponsorship (detail panel only) */
+.h1b-badge.h1b-nosponsor {
+  background: #fee2e2;
+  color: #b91c1c;
+  border: 1px solid #fca5a5;
+}
+
+/* Stacks the 🔴 badge and its historical-tier subtext under the company name */
+.h1b-nosponsor-wrap {
+  display: block;
+  margin: 4px 0 2px;
+}
+
+.h1b-nosponsor-sub {
+  font-size: 10px;
+  color: #6b7280;
+  margin-top: 2px;
+}
+
 /* Left job list — always show on its own line under company name */
 .h1b-badge--list,
 .job-card-list__entity-lockup .h1b-badge,

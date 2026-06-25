@@ -145,10 +145,22 @@ class ExtensionSelectors(BaseModel):
     job_card: List[str]
 
 
+class NoSponsorRules(BaseModel):
+    """Regex sources (JS, case-insensitive) for the per-posting 🔴 "no sponsorship" badge.
+
+    The extension flags a posting only when a `negative` pattern matches AND no
+    `affirmative` pattern does — conservative on purpose (prefer a miss over a wrong
+    red badge that would scare a user off a job that does sponsor).
+    """
+    negative: List[str]
+    affirmative: List[str]
+
+
 class ExtensionConfigResponse(BaseModel):
     """Remote config for the LinkedIn content script."""
     version: str
     selectors: ExtensionSelectors
+    no_sponsor: NoSponsorRules
 
 
 class SelectorMissReport(BaseModel):
@@ -160,7 +172,7 @@ class SelectorMissReport(BaseModel):
 
 # Remote extension config (also embedded in content.js as fallbacks).
 # Primary company detection uses /company/{slug} URLs — CSS lists are backup only.
-EXTENSION_CONFIG_VERSION = "1.0.6"
+EXTENSION_CONFIG_VERSION = "1.1.0"
 EXTENSION_COMPANY_SELECTORS: List[str] = [
     ".job-card-container__company-name",
     ".job-card-container__primary-description",
@@ -181,6 +193,28 @@ EXTENSION_JOB_CARD_SELECTORS: List[str] = [
     "li.scaffold-layout__list-item",
     ".job-card-list__entity-lockup",
     "[data-job-id]",
+]
+
+# Per-posting 🔴 "no sponsorship" rules — JS regex sources, case-insensitive, also
+# embedded in content.js as fallbacks. Hot-reloadable here when LinkedIn job-posting
+# wording shifts, without republishing the extension.
+#
+# A posting is flagged only if a NEGATIVE matches AND no AFFIRMATIVE does (conservative).
+EXTENSION_NO_SPONSOR_NEGATIVE: List[str] = [
+    r"\b(do(es)?\s+not|will\s+not|cannot|are\s+not\s+able\s+to|unable\s+to)\b[^.]{0,40}\bsponsor",
+    r"\bno\b[^.]{0,20}\b(visa\s+)?sponsorship\b",
+    r"\bwithout\b[^.]{0,30}\bsponsorship\b",
+    r"\bnot\s+(eligible|available)\b[^.]{0,20}\bsponsorship\b",
+    r"\b(US|U\.S\.)\s+citizen(ship)?\s+(is\s+)?required\b",
+    r"\bcitizenship\s+(is\s+)?required\b",
+    r"\bcitizens?\s+only\b",
+]
+EXTENSION_NO_SPONSOR_AFFIRMATIVE: List[str] = [
+    r"will\s+sponsor",
+    r"\bdo(es)?\s+sponsor",
+    r"sponsorship\s+(is\s+)?(available|provided|offered)",
+    r"(visa\s+)?sponsorship\s+available",
+    r"\bable\s+to\s+sponsor",
 ]
 
 # Default semantic similarity threshold for the resolution module's Layer 4.
@@ -341,6 +375,10 @@ async def get_extension_config():
         selectors=ExtensionSelectors(
             company_name=EXTENSION_COMPANY_SELECTORS,
             job_card=EXTENSION_JOB_CARD_SELECTORS,
+        ),
+        no_sponsor=NoSponsorRules(
+            negative=EXTENSION_NO_SPONSOR_NEGATIVE,
+            affirmative=EXTENSION_NO_SPONSOR_AFFIRMATIVE,
         ),
     )
 
